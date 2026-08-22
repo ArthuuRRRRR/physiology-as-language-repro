@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Environments
+.env
+venv/
+.env/
+
+# Data
+data/
+datasets/
+*.edf
+*.npy
+*.npz
+*.mmap
+*.h5
+*.hdf5
+
+# Models / outputs
+checkpoints/
+outputs/
+runs/
+wandb/
+*.pth
+*.pt
+*.ckpt
+
+# System
+.DS_Store
+.vscode/
