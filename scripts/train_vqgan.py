@@ -1,5 +1,13 @@
 import argparse
+import sys
+from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -32,12 +40,136 @@ def correlation_loss(x, y, eps=1e-8):
     return 1.0 - correlation.mean()
 
 
+def save_reconstruction(
+    model,
+    dataset,
+    device,
+    output_path,
+):
+    """
+    Save one ground-truth / reconstruction comparison.
+    """
+
+    model.eval()
+
+    sample = dataset[0]
+
+    eeg = (
+        sample["eeg_spectrogram"]
+        .unsqueeze(0)
+        .unsqueeze(0)
+        .to(device)
+    )
+
+    with torch.no_grad():
+        reconstruction, indices, _ = model(eeg)
+
+    original = (
+        eeg[0, 0]
+        .detach()
+        .cpu()
+        .numpy()
+    )
+
+    reconstructed = (
+        reconstruction[0, 0]
+        .detach()
+        .cpu()
+        .numpy()
+    )
+
+    difference = abs(
+        original - reconstructed
+    )
+
+    print()
+    print(
+        "Token grid shape:",
+        tuple(indices.shape),
+    )
+
+    print(
+        "Unique codebook entries used:",
+        torch.unique(indices).numel(),
+    )
+
+    print(
+        "Total tokens:",
+        indices.numel(),
+    )
+
+    fig, axes = plt.subplots(
+        3,
+        1,
+        figsize=(12, 8),
+    )
+
+    axes[0].imshow(
+        original,
+        aspect="auto",
+        origin="lower",
+        vmin=0,
+        vmax=1,
+    )
+    axes[0].set_title(
+        "Ground-truth EEG spectrogram"
+    )
+
+    axes[1].imshow(
+        reconstructed,
+        aspect="auto",
+        origin="lower",
+        vmin=0,
+        vmax=1,
+    )
+    axes[1].set_title(
+        "VQGAN reconstruction"
+    )
+
+    axes[2].imshow(
+        difference,
+        aspect="auto",
+        origin="lower",
+    )
+    axes[2].set_title(
+        "Absolute difference"
+    )
+
+    for ax in axes:
+        ax.set_xlabel(
+            "Time (30-second epochs)"
+        )
+        ax.set_ylabel(
+            "Frequency bins"
+        )
+
+    plt.tight_layout()
+
+    plt.savefig(
+        output_path,
+        dpi=150,
+    )
+
+    plt.close()
+
+    print(
+        f"Reconstruction saved to: "
+        f"{output_path}"
+    )
+
+
 def main():
+
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
         "--data-dir",
         default="outputs/mesa_preprocessed",
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        default="outputs/vqgan",
     )
 
     parser.add_argument(
@@ -60,6 +192,15 @@ def main():
 
     args = parser.parse_args()
 
+    output_dir = Path(
+        args.output_dir
+    )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
     device = (
         "cuda"
         if torch.cuda.is_available()
@@ -70,6 +211,11 @@ def main():
 
     dataset = PhysiologyPairDataset(
         args.data_dir
+    )
+
+    print(
+        "Number of samples:",
+        len(dataset),
     )
 
     loader = DataLoader(
@@ -85,6 +231,8 @@ def main():
         model.parameters(),
         lr=args.lr,
     )
+
+    best_loss = float("inf")
 
     for epoch in range(args.epochs):
 
@@ -130,19 +278,77 @@ def main():
             optimizer.step()
 
             total_loss += loss.item()
-            total_recon += reconstruction_loss.item()
+
+            total_recon += (
+                reconstruction_loss.item()
+            )
+
             total_vq += vq_loss.item()
-            total_corr += corr_loss.item()
+
+            total_corr += (
+                corr_loss.item()
+            )
 
         n = len(loader)
 
+        avg_loss = total_loss / n
+        avg_recon = total_recon / n
+        avg_vq = total_vq / n
+        avg_corr = total_corr / n
+
         print(
             f"Epoch {epoch + 1:03d} | "
-            f"loss={total_loss / n:.4f} | "
-            f"recon={total_recon / n:.4f} | "
-            f"vq={total_vq / n:.4f} | "
-            f"corr={total_corr / n:.4f}"
+            f"loss={avg_loss:.4f} | "
+            f"recon={avg_recon:.4f} | "
+            f"vq={avg_vq:.4f} | "
+            f"corr={avg_corr:.4f}"
         )
+
+        checkpoint = {
+            "epoch": epoch + 1,
+            "model_state_dict": (
+                model.state_dict()
+            ),
+            "optimizer_state_dict": (
+                optimizer.state_dict()
+            ),
+            "loss": avg_loss,
+        }
+
+        # Always keep latest checkpoint
+        torch.save(
+            checkpoint,
+            output_dir
+            / "checkpoint_latest.pt",
+        )
+
+        # Keep best checkpoint
+        if avg_loss < best_loss:
+
+            best_loss = avg_loss
+
+            torch.save(
+                checkpoint,
+                output_dir
+                / "checkpoint_best.pt",
+            )
+
+    # Visual reconstruction after training
+    save_reconstruction(
+        model=model,
+        dataset=dataset,
+        device=device,
+        output_path=(
+            output_dir
+            / "reconstruction.png"
+        ),
+    )
+
+    print()
+    print(
+        f"Best training loss: "
+        f"{best_loss:.4f}"
+    )
 
 
 if __name__ == "__main__":
