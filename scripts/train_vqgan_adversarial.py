@@ -1,13 +1,17 @@
 import argparse
+import json
 import sys
 from pathlib import Path
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -22,7 +26,6 @@ from src.models.discriminator import (
 
 
 def correlation_loss(x, y, eps=1e-8):
-
     x = x.flatten(start_dim=1)
     y = y.flatten(start_dim=1)
 
@@ -43,7 +46,315 @@ def correlation_loss(x, y, eps=1e-8):
 
 def set_requires_grad(model, value):
     for parameter in model.parameters():
-        parameter.requires_grad = value
+        parameter.requires_grad_(value)
+
+
+def load_datasets(
+    data_root,
+    normalization_file,
+    held_out_fold,
+):
+    with normalization_file.open(
+        "r",
+        encoding="utf-8",
+    ) as file:
+        normalization = json.load(file)
+
+    run = normalization["runs"][
+        str(held_out_fold)
+    ]
+
+    train_folds = run["train_folds"]
+    min_db = float(run["min_db"])
+    max_db = float(run["max_db"])
+
+    train_directories = [
+        data_root / f"fold_{fold}"
+        for fold in train_folds
+    ]
+
+    validation_directory = (
+        data_root / f"fold_{held_out_fold}"
+    )
+
+    train_dataset = PhysiologyPairDataset(
+        train_directories,
+        min_db=min_db,
+        max_db=max_db,
+    )
+
+    validation_dataset = PhysiologyPairDataset(
+        validation_directory,
+        min_db=min_db,
+        max_db=max_db,
+    )
+
+    return (
+        train_dataset,
+        validation_dataset,
+        train_folds,
+        min_db,
+        max_db,
+    )
+
+
+def reconstruction_losses(
+    reconstruction,
+    target,
+    vq_loss,
+    corr_weight,
+):
+    reconstruction_loss = F.l1_loss(
+        reconstruction,
+        target,
+    )
+
+    corr_loss = correlation_loss(
+        reconstruction,
+        target,
+    )
+
+    base_loss = (
+        reconstruction_loss
+        + vq_loss
+        + corr_weight * corr_loss
+    )
+
+    return (
+        base_loss,
+        reconstruction_loss,
+        corr_loss,
+    )
+
+
+def train_epoch(
+    model,
+    discriminator,
+    loader,
+    optimizer_vqgan,
+    optimizer_disc,
+    device,
+    corr_weight,
+    adv_weight,
+    max_batches=None,
+):
+    model.train()
+    discriminator.train()
+
+    totals = {
+        "generator": 0.0,
+        "discriminator": 0.0,
+        "reconstruction": 0.0,
+        "vq": 0.0,
+        "correlation": 0.0,
+        "adversarial": 0.0,
+    }
+
+    processed_batches = 0
+
+    for batch_index, batch in enumerate(loader):
+
+        if (
+            max_batches is not None
+            and batch_index >= max_batches
+        ):
+            break
+
+        eeg = (
+            batch["eeg_spectrogram"]
+            .unsqueeze(1)
+            .to(device)
+        )
+
+        # ----------------------------------
+        # 1. Train discriminator
+        # ----------------------------------
+
+        discriminator.train()
+
+        set_requires_grad(
+            discriminator,
+            True,
+        )
+
+        optimizer_disc.zero_grad(
+            set_to_none=True
+        )
+
+        with torch.no_grad():
+            fake_eeg, _, _ = model(eeg)
+
+        real_logits = discriminator(eeg)
+
+        fake_logits = discriminator(
+            fake_eeg.detach()
+        )
+
+        discriminator_loss = (
+            discriminator_hinge_loss(
+                real_logits,
+                fake_logits,
+            )
+        )
+
+        discriminator_loss.backward()
+        optimizer_disc.step()
+
+        # ----------------------------------
+        # 2. Train VQGAN generator
+        # ----------------------------------
+
+        discriminator.eval()
+
+        set_requires_grad(
+            discriminator,
+            False,
+        )
+
+        optimizer_vqgan.zero_grad(
+            set_to_none=True
+        )
+
+        reconstruction, _, vq_loss = model(eeg)
+
+        (
+            base_loss,
+            reconstruction_loss,
+            corr_loss,
+        ) = reconstruction_losses(
+            reconstruction=reconstruction,
+            target=eeg,
+            vq_loss=vq_loss,
+            corr_weight=corr_weight,
+        )
+
+        fake_logits = discriminator(
+            reconstruction
+        )
+
+        adversarial_loss = (
+            generator_adversarial_loss(
+                fake_logits
+            )
+        )
+
+        generator_loss = (
+            base_loss
+            + adv_weight * adversarial_loss
+        )
+
+        generator_loss.backward()
+        optimizer_vqgan.step()
+
+        set_requires_grad(
+            discriminator,
+            True,
+        )
+
+        totals["generator"] += (
+            generator_loss.item()
+        )
+
+        totals["discriminator"] += (
+            discriminator_loss.item()
+        )
+
+        totals["reconstruction"] += (
+            reconstruction_loss.item()
+        )
+
+        totals["vq"] += vq_loss.item()
+
+        totals["correlation"] += (
+            corr_loss.item()
+        )
+
+        totals["adversarial"] += (
+            adversarial_loss.item()
+        )
+
+        processed_batches += 1
+
+    if processed_batches == 0:
+        raise RuntimeError(
+            "No training batch was processed."
+        )
+
+    return {
+        name: value / processed_batches
+        for name, value in totals.items()
+    }
+
+
+@torch.no_grad()
+def validate_epoch(
+    model,
+    loader,
+    device,
+    corr_weight,
+    max_batches=None,
+):
+    model.eval()
+
+    totals = {
+        "loss": 0.0,
+        "reconstruction": 0.0,
+        "vq": 0.0,
+        "correlation": 0.0,
+    }
+
+    processed_batches = 0
+
+    for batch_index, batch in enumerate(loader):
+
+        if (
+            max_batches is not None
+            and batch_index >= max_batches
+        ):
+            break
+
+        eeg = (
+            batch["eeg_spectrogram"]
+            .unsqueeze(1)
+            .to(device)
+        )
+
+        reconstruction, _, vq_loss = model(eeg)
+
+        (
+            base_loss,
+            reconstruction_loss,
+            corr_loss,
+        ) = reconstruction_losses(
+            reconstruction=reconstruction,
+            target=eeg,
+            vq_loss=vq_loss,
+            corr_weight=corr_weight,
+        )
+
+        totals["loss"] += base_loss.item()
+
+        totals["reconstruction"] += (
+            reconstruction_loss.item()
+        )
+
+        totals["vq"] += vq_loss.item()
+
+        totals["correlation"] += (
+            corr_loss.item()
+        )
+
+        processed_batches += 1
+
+    if processed_batches == 0:
+        raise RuntimeError(
+            "No validation batch was processed."
+        )
+
+    return {
+        name: value / processed_batches
+        for name, value in totals.items()
+    }
 
 
 def save_reconstruction(
@@ -52,7 +363,6 @@ def save_reconstruction(
     device,
     output_path,
 ):
-
     model.eval()
 
     sample = dataset[0]
@@ -69,32 +379,33 @@ def save_reconstruction(
 
     original = (
         eeg[0, 0]
+        .detach()
         .cpu()
         .numpy()
     )
 
     reconstructed = (
         reconstruction[0, 0]
+        .detach()
         .cpu()
         .numpy()
     )
 
-    difference = abs(
+    difference = np.abs(
         original - reconstructed
     )
 
-    print()
     print(
         "Token grid:",
-        tuple(indices.shape)
+        tuple(indices.shape),
     )
 
     print(
         "Unique codes in example:",
-        torch.unique(indices).numel()
+        torch.unique(indices).numel(),
     )
 
-    fig, axes = plt.subplots(
+    figure, axes = plt.subplots(
         3,
         1,
         figsize=(12, 8),
@@ -109,7 +420,7 @@ def save_reconstruction(
     )
 
     axes[0].set_title(
-        "Ground-truth EEG"
+        "Ground-truth EEG spectrogram"
     )
 
     axes[1].imshow(
@@ -121,7 +432,7 @@ def save_reconstruction(
     )
 
     axes[1].set_title(
-        "VQGAN + adversarial reconstruction"
+        "Adversarial VQGAN reconstruction"
     )
 
     axes[2].imshow(
@@ -134,41 +445,68 @@ def save_reconstruction(
         "Absolute difference"
     )
 
-    for ax in axes:
-        ax.set_xlabel(
+    for axis in axes:
+        axis.set_xlabel(
             "Time (30-second epochs)"
         )
-        ax.set_ylabel(
+
+        axis.set_ylabel(
             "Frequency bins"
         )
 
     plt.tight_layout()
-
-    plt.savefig(
-        output_path,
-        dpi=150,
-    )
-
+    plt.savefig(output_path, dpi=150)
     plt.close()
+
+    print(
+        f"Reconstruction saved: {output_path}"
+    )
 
 
 def main():
-
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Adversarial fine-tuning of a pretrained "
+            "SHHS VQGAN."
+        )
+    )
 
     parser.add_argument(
-        "--data-dir",
-        default="outputs/shhs_preprocessed",
+        "--data-root",
+        type=Path,
+        default=Path(
+            "outputs/shhs_preprocessed"
+        ),
+    )
+
+    parser.add_argument(
+        "--normalization-file",
+        type=Path,
+        default=Path(
+            "outputs/normalization/"
+            "shhs_cv_normalization.json"
+        ),
+    )
+
+    parser.add_argument(
+        "--held-out-fold",
+        type=int,
+        choices=[0, 1, 2, 3],
+        required=True,
     )
 
     parser.add_argument(
         "--vqgan-checkpoint",
-        default="outputs/vqgan/checkpoint_best.pt",
+        type=Path,
+        default=None,
     )
 
     parser.add_argument(
         "--output-dir",
-        default="outputs/vqgan_adversarial",
+        type=Path,
+        default=Path(
+            "outputs/vqgan_adversarial"
+        ),
     )
 
     parser.add_argument(
@@ -207,64 +545,131 @@ def main():
         default=0.01,
     )
 
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+    )
+
+    parser.add_argument(
+        "--max-train-batches",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--max-val-batches",
+        type=int,
+        default=None,
+    )
+
     args = parser.parse_args()
 
-    output_dir = Path(
-        args.output_dir
-    )
+    torch.manual_seed(42)
+    np.random.seed(42)
 
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
 
-    device = (
+    device = torch.device(
         "cuda"
         if torch.cuda.is_available()
         else "cpu"
     )
 
+    if args.vqgan_checkpoint is None:
+        vqgan_checkpoint = (
+            Path("outputs/vqgan")
+            / f"held_out_fold_{args.held_out_fold}"
+            / "checkpoint_best.pt"
+        )
+    else:
+        vqgan_checkpoint = (
+            args.vqgan_checkpoint
+        )
+
+    if not vqgan_checkpoint.exists():
+        raise FileNotFoundError(
+            f"Baseline checkpoint not found: "
+            f"{vqgan_checkpoint}"
+        )
+
+    run_output_dir = (
+        args.output_dir
+        / f"held_out_fold_{args.held_out_fold}"
+    )
+
+    run_output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    (
+        train_dataset,
+        validation_dataset,
+        train_folds,
+        min_db,
+        max_db,
+    ) = load_datasets(
+        data_root=args.data_root,
+        normalization_file=(
+            args.normalization_file
+        ),
+        held_out_fold=args.held_out_fold,
+    )
+
     print("Device:", device)
-
-    dataset = PhysiologyPairDataset(
-        args.data_dir
-    )
-
+    print("Baseline:", vqgan_checkpoint)
+    print("Training folds:", train_folds)
     print(
-        "Samples:",
-        len(dataset)
+        "Training samples:",
+        len(train_dataset),
+    )
+    print(
+        "Held-out fold:",
+        args.held_out_fold,
+    )
+    print(
+        "Validation samples:",
+        len(validation_dataset),
+    )
+    print(
+        f"Normalization: "
+        f"[{min_db:.2f}, {max_db:.2f}] dB"
+    )
+    print(
+        "Adversarial weight:",
+        args.adv_weight,
     )
 
-    loader = DataLoader(
-        dataset,
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
     )
 
-    # ----------------------
-    # VQGAN
-    # ----------------------
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
 
     model = VQGAN().to(device)
 
-    checkpoint = torch.load(
-        args.vqgan_checkpoint,
+    baseline_checkpoint = torch.load(
+        vqgan_checkpoint,
         map_location=device,
     )
 
     model.load_state_dict(
-        checkpoint["model_state_dict"]
+        baseline_checkpoint[
+            "model_state_dict"
+        ]
     )
-
-    print(
-        "Loaded VQGAN checkpoint:",
-        args.vqgan_checkpoint
-    )
-
-    # ----------------------
-    # Discriminator
-    # ----------------------
 
     discriminator = (
         PatchDiscriminator()
@@ -281,223 +686,123 @@ def main():
         lr=args.disc_lr,
     )
 
-    best_recon = float("inf")
+    best_validation_loss = float("inf")
 
-    for epoch in range(args.epochs):
+    best_checkpoint_path = (
+        run_output_dir
+        / "checkpoint_best.pt"
+    )
 
-        model.train()
-        discriminator.train()
+    for epoch in range(1, args.epochs + 1):
 
-        total_generator = 0.0
-        total_discriminator = 0.0
-
-        total_recon = 0.0
-        total_vq = 0.0
-        total_corr = 0.0
-        total_adv = 0.0
-
-        for batch in loader:
-
-            eeg = (
-                batch["eeg_spectrogram"]
-                .unsqueeze(1)
-                .to(device)
-            )
-
-            # ==================================
-            # 1. Train discriminator
-            # ==================================
-
-            set_requires_grad(
-                discriminator,
-                True,
-            )
-
-            optimizer_disc.zero_grad()
-
-            with torch.no_grad():
-
-                fake_eeg, _, _ = model(
-                    eeg
-                )
-
-            real_logits = discriminator(
-                eeg
-            )
-
-            fake_logits = discriminator(
-                fake_eeg.detach()
-            )
-
-            d_loss = (
-                discriminator_hinge_loss(
-                    real_logits,
-                    fake_logits,
-                )
-            )
-
-            d_loss.backward()
-
-            optimizer_disc.step()
-
-            # ==================================
-            # 2. Train VQGAN / generator
-            # ==================================
-
-            set_requires_grad(
-                discriminator,
-                False,
-            )
-
-            optimizer_vqgan.zero_grad()
-
-            reconstruction, indices, vq_loss = (
-                model(eeg)
-            )
-
-            recon_loss = F.l1_loss(
-                reconstruction,
-                eeg,
-            )
-
-            corr_loss = correlation_loss(
-                reconstruction,
-                eeg,
-            )
-
-            fake_logits = discriminator(
-                reconstruction
-            )
-
-            adv_loss = (
-                generator_adversarial_loss(
-                    fake_logits
-                )
-            )
-
-            generator_loss = (
-                recon_loss
-                + vq_loss
-                + args.corr_weight * corr_loss
-                + args.adv_weight * adv_loss
-            )
-
-            generator_loss.backward()
-
-            optimizer_vqgan.step()
-
-            set_requires_grad(
-                discriminator,
-                True,
-            )
-
-            total_generator += (
-                generator_loss.item()
-            )
-
-            total_discriminator += (
-                d_loss.item()
-            )
-
-            total_recon += (
-                recon_loss.item()
-            )
-
-            total_vq += (
-                vq_loss.item()
-            )
-
-            total_corr += (
-                corr_loss.item()
-            )
-
-            total_adv += (
-                adv_loss.item()
-            )
-
-        n = len(loader)
-
-        avg_generator = (
-            total_generator / n
+        train_metrics = train_epoch(
+            model=model,
+            discriminator=discriminator,
+            loader=train_loader,
+            optimizer_vqgan=optimizer_vqgan,
+            optimizer_disc=optimizer_disc,
+            device=device,
+            corr_weight=args.corr_weight,
+            adv_weight=args.adv_weight,
+            max_batches=(
+                args.max_train_batches
+            ),
         )
 
-        avg_discriminator = (
-            total_discriminator / n
-        )
-
-        avg_recon = (
-            total_recon / n
-        )
-
-        avg_vq = (
-            total_vq / n
-        )
-
-        avg_corr = (
-            total_corr / n
-        )
-
-        avg_adv = (
-            total_adv / n
+        validation_metrics = validate_epoch(
+            model=model,
+            loader=validation_loader,
+            device=device,
+            corr_weight=args.corr_weight,
+            max_batches=(
+                args.max_val_batches
+            ),
         )
 
         print(
-            f"Epoch {epoch + 1:03d} | "
-            f"G={avg_generator:.4f} | "
-            f"D={avg_discriminator:.4f} | "
-            f"recon={avg_recon:.4f} | "
-            f"vq={avg_vq:.4f} | "
-            f"corr={avg_corr:.4f} | "
-            f"adv={avg_adv:.4f}"
+            f"Epoch {epoch:03d} | "
+            f"G={train_metrics['generator']:.4f} | "
+            f"D={train_metrics['discriminator']:.4f} | "
+            f"adv={train_metrics['adversarial']:.4f} | "
+            f"train_recon="
+            f"{train_metrics['reconstruction']:.4f} | "
+            f"val={validation_metrics['loss']:.4f} | "
+            f"val_recon="
+            f"{validation_metrics['reconstruction']:.4f}"
         )
 
         checkpoint = {
-            "epoch": epoch + 1,
-            "model_state_dict":
-                model.state_dict(),
-            "discriminator_state_dict":
-                discriminator.state_dict(),
-            "optimizer_vqgan_state_dict":
-                optimizer_vqgan.state_dict(),
-            "optimizer_disc_state_dict":
-                optimizer_disc.state_dict(),
-            "reconstruction_loss":
-                avg_recon,
+            "epoch": epoch,
+            "held_out_fold": (
+                args.held_out_fold
+            ),
+            "train_folds": train_folds,
+            "min_db": min_db,
+            "max_db": max_db,
+            "corr_weight": args.corr_weight,
+            "adv_weight": args.adv_weight,
+            "baseline_checkpoint": str(
+                vqgan_checkpoint
+            ),
+            "model_state_dict": (
+                model.state_dict()
+            ),
+            "discriminator_state_dict": (
+                discriminator.state_dict()
+            ),
+            "optimizer_vqgan_state_dict": (
+                optimizer_vqgan.state_dict()
+            ),
+            "optimizer_disc_state_dict": (
+                optimizer_disc.state_dict()
+            ),
+            "train_metrics": train_metrics,
+            "validation_metrics": (
+                validation_metrics
+            ),
         }
 
         torch.save(
             checkpoint,
-            output_dir
+            run_output_dir
             / "checkpoint_latest.pt",
         )
 
-        # Use reconstruction loss to select
-        # the best checkpoint because GAN
-        # generator loss can be negative.
-        if avg_recon < best_recon:
-
-            best_recon = avg_recon
+        if (
+            validation_metrics["loss"]
+            < best_validation_loss
+        ):
+            best_validation_loss = (
+                validation_metrics["loss"]
+            )
 
             torch.save(
                 checkpoint,
-                output_dir
-                / "checkpoint_best.pt",
+                best_checkpoint_path,
             )
+
+    best_checkpoint = torch.load(
+        best_checkpoint_path,
+        map_location=device,
+    )
+
+    model.load_state_dict(
+        best_checkpoint["model_state_dict"]
+    )
 
     save_reconstruction(
         model=model,
-        dataset=dataset,
+        dataset=validation_dataset,
         device=device,
         output_path=(
-            output_dir
+            run_output_dir
             / "reconstruction.png"
         ),
     )
 
-    print()
     print(
-        "Best reconstruction loss:",
-        best_recon
+        f"Best validation loss: "
+        f"{best_validation_loss:.4f}"
     )
 
 
