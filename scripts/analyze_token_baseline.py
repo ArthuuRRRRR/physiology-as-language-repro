@@ -14,16 +14,25 @@ if str(PROJECT_ROOT) not in sys.path:
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from src.data.dataset import PhysiologyPairDataset
+from src.models.masked_transformer import (
+    RespirationToEEGTransformer,
+)
+from src.models.mage_transformer import (
+    MAGERespirationToEEGTransformer,
+)
 from src.models.vqgan import VQGAN
 
 from scripts.evaluate_masked_transformer import (
+    ShuffledRespirationDataset,
     decode_token_ids,
     load_state_dict,
     sample_correlation,
     sample_snr,
+    standardize_respiration,
     temporal_correlation,
 )
 
@@ -34,6 +43,11 @@ DEFAULT_DATA_ROOT = Path(
 
 DEFAULT_VQGAN_CHECKPOINT = Path(
     "outputs/vqgan_adversarial_w0001/"
+    "held_out_fold_0/checkpoint_best.pt"
+)
+
+DEFAULT_TRANSFORMER_CHECKPOINT = Path(
+    "outputs/masked_transformer_joint_long/"
     "held_out_fold_0/checkpoint_best.pt"
 )
 
@@ -72,6 +86,442 @@ def load_vqgan(
         parameter.requires_grad = False
 
     return model, checkpoint
+
+
+def load_transformer(
+    checkpoint_path,
+    device,
+):
+    """Load either supported respiration-to-EEG Transformer."""
+
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    architecture = checkpoint.get(
+        "architecture",
+        "joint_concatenated_transformer",
+    )
+
+    if architecture == "mage_visible_encoder_decoder":
+        model = MAGERespirationToEEGTransformer()
+
+    elif architecture in (
+        None,
+        "joint_concatenated_transformer",
+    ):
+        model = RespirationToEEGTransformer()
+
+    else:
+        raise ValueError(
+            "Unsupported Transformer architecture: "
+            f"{architecture}"
+        )
+
+    model.load_state_dict(
+        load_state_dict(
+            checkpoint,
+            possible_keys=[
+                "model_state_dict",
+                "transformer_state_dict",
+            ],
+        ),
+        strict=True,
+    )
+
+    model = model.to(device)
+    model.eval()
+
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+
+    return model, checkpoint
+
+
+def create_semantic_accumulator():
+    """Create storage for codebook-vector distance values."""
+
+    return {
+        "positions": 0,
+        "exact_matches": 0,
+        "cosine_chunks": [],
+        "l2_chunks": [],
+        "incorrect_cosine_chunks": [],
+        "incorrect_l2_chunks": [],
+    }
+
+
+def update_semantic_accumulator(
+    accumulator,
+    target_tokens,
+    predicted_tokens,
+    normalized_codebook,
+):
+    """Accumulate cosine similarity and L2 codebook distance."""
+
+    target_ids = target_tokens.reshape(-1).long()
+    predicted_ids = predicted_tokens.reshape(-1).long()
+
+    if target_ids.shape != predicted_ids.shape:
+        raise ValueError(
+            "Target and predicted token shapes differ: "
+            f"{target_ids.shape} vs {predicted_ids.shape}"
+        )
+
+    target_ids = target_ids.to(
+        normalized_codebook.device
+    )
+    predicted_ids = predicted_ids.to(
+        normalized_codebook.device
+    )
+
+    target_vectors = F.embedding(
+        target_ids,
+        normalized_codebook,
+    )
+    predicted_vectors = F.embedding(
+        predicted_ids,
+        normalized_codebook,
+    )
+
+    cosine = (
+        target_vectors
+        * predicted_vectors
+    ).sum(dim=-1).clamp(-1.0, 1.0)
+
+    l2_distance = torch.linalg.vector_norm(
+        target_vectors - predicted_vectors,
+        ord=2,
+        dim=-1,
+    )
+
+    exact = target_ids == predicted_ids
+    incorrect = ~exact
+
+    accumulator["positions"] += target_ids.numel()
+    accumulator["exact_matches"] += int(
+        exact.sum().item()
+    )
+
+    accumulator["cosine_chunks"].append(
+        cosine.detach().cpu()
+    )
+    accumulator["l2_chunks"].append(
+        l2_distance.detach().cpu()
+    )
+
+    if incorrect.any():
+        accumulator[
+            "incorrect_cosine_chunks"
+        ].append(
+            cosine[incorrect].detach().cpu()
+        )
+        accumulator[
+            "incorrect_l2_chunks"
+        ].append(
+            l2_distance[incorrect].detach().cpu()
+        )
+
+
+def distribution_summary(values):
+    """Return JSON-safe summary statistics for one tensor."""
+
+    if values.numel() < 1:
+        return None
+
+    values = values.float()
+    quantiles = torch.quantile(
+        values,
+        torch.tensor(
+            [0.05, 0.25, 0.50, 0.75, 0.95],
+            dtype=values.dtype,
+        ),
+    )
+
+    return {
+        "count": int(values.numel()),
+        "mean": float(values.mean()),
+        "std": float(
+            values.std(unbiased=False)
+        ),
+        "p05": float(quantiles[0]),
+        "p25": float(quantiles[1]),
+        "median": float(quantiles[2]),
+        "p75": float(quantiles[3]),
+        "p95": float(quantiles[4]),
+    }
+
+
+def finalize_semantic_accumulator(
+    accumulator,
+):
+    """Finalize semantic codebook-distance metrics."""
+
+    if accumulator["positions"] < 1:
+        raise ValueError(
+            "Cannot finalize empty semantic metrics"
+        )
+
+    cosine = torch.cat(
+        accumulator["cosine_chunks"]
+    )
+    l2_distance = torch.cat(
+        accumulator["l2_chunks"]
+    )
+
+    if accumulator[
+        "incorrect_cosine_chunks"
+    ]:
+        incorrect_cosine = torch.cat(
+            accumulator[
+                "incorrect_cosine_chunks"
+            ]
+        )
+        incorrect_l2 = torch.cat(
+            accumulator[
+                "incorrect_l2_chunks"
+            ]
+        )
+
+    else:
+        incorrect_cosine = torch.empty(0)
+        incorrect_l2 = torch.empty(0)
+
+    return {
+        "positions": accumulator["positions"],
+        "exact_token_accuracy": (
+            accumulator["exact_matches"]
+            / accumulator["positions"]
+        ),
+        "cosine_similarity": (
+            distribution_summary(cosine)
+        ),
+        "l2_distance": (
+            distribution_summary(l2_distance)
+        ),
+        "incorrect_tokens_only": {
+            "cosine_similarity": (
+                distribution_summary(
+                    incorrect_cosine
+                )
+            ),
+            "l2_distance": (
+                distribution_summary(
+                    incorrect_l2
+                )
+            ),
+        },
+    }
+
+
+def print_semantic_metrics(
+    condition_name,
+    metrics,
+):
+    """Print the decision metrics for one prediction condition."""
+
+    cosine = metrics["cosine_similarity"]
+    l2_distance = metrics["l2_distance"]
+    incorrect_cosine = metrics[
+        "incorrect_tokens_only"
+    ]["cosine_similarity"]
+
+    print(f"  {condition_name}")
+    print(
+        "    exact_accuracy=",
+        f"{metrics['exact_token_accuracy']:.4f}",
+        sep="",
+    )
+    print(
+        "    cosine_mean=",
+        f"{cosine['mean']:.4f}",
+        " | cosine_median=",
+        f"{cosine['median']:.4f}",
+        " | cosine_p05=",
+        f"{cosine['p05']:.4f}",
+        " | cosine_p95=",
+        f"{cosine['p95']:.4f}",
+        sep="",
+    )
+    print(
+        "    incorrect_only_cosine_mean=",
+        f"{incorrect_cosine['mean']:.4f}",
+        " | incorrect_only_cosine_median=",
+        f"{incorrect_cosine['median']:.4f}",
+        sep="",
+    )
+    print(
+        "    l2_mean=",
+        f"{l2_distance['mean']:.4f}",
+        " | l2_median=",
+        f"{l2_distance['median']:.4f}",
+        sep="",
+    )
+
+
+def evaluate_transformer_semantics(
+    transformer,
+    vqgan,
+    loader,
+    device,
+    normalized_codebook,
+    max_samples,
+    condition_name,
+):
+    """Evaluate full-mask Transformer predictions in VQ space."""
+
+    accumulator = create_semantic_accumulator()
+    evaluated_samples = 0
+
+    with torch.inference_mode():
+        for batch in loader:
+            if evaluated_samples >= max_samples:
+                break
+
+            remaining = max_samples - evaluated_samples
+
+            respiration = batch["respiration"][
+                :remaining
+            ].to(
+                device,
+                non_blocking=True,
+            )
+
+            eeg = (
+                batch["eeg_spectrogram"][:remaining]
+                .unsqueeze(1)
+                .to(
+                    device,
+                    non_blocking=True,
+                )
+            )
+
+            respiration = standardize_respiration(
+                respiration
+            )
+
+            _, true_tokens, _ = vqgan.encode(eeg)
+
+            masked_tokens = torch.full_like(
+                true_tokens,
+                fill_value=(
+                    transformer.mask_token_id
+                ),
+            )
+
+            logits = transformer(
+                respiration,
+                masked_tokens,
+            )
+
+            predicted_tokens = (
+                logits.argmax(dim=-1)
+                .reshape_as(true_tokens)
+            )
+
+            update_semantic_accumulator(
+                accumulator=accumulator,
+                target_tokens=true_tokens,
+                predicted_tokens=(
+                    predicted_tokens
+                ),
+                normalized_codebook=(
+                    normalized_codebook
+                ),
+            )
+
+            evaluated_samples += eeg.shape[0]
+
+            if evaluated_samples % 25 == 0:
+                print(
+                    f"{condition_name} samples evaluated:",
+                    evaluated_samples,
+                    flush=True,
+                )
+
+    metrics = finalize_semantic_accumulator(
+        accumulator
+    )
+    metrics["evaluated_samples"] = evaluated_samples
+
+    return metrics
+
+
+def evaluate_fixed_token_semantics(
+    vqgan,
+    loader,
+    predicted_token_grid,
+    device,
+    normalized_codebook,
+    max_samples,
+    condition_name,
+):
+    """Evaluate one fixed 8 x 64 token template in VQ space."""
+
+    predicted_token_grid = (
+        predicted_token_grid
+        .reshape(1, 8, 64)
+        .long()
+        .to(device)
+    )
+
+    accumulator = create_semantic_accumulator()
+    evaluated_samples = 0
+
+    with torch.inference_mode():
+        for batch in loader:
+            if evaluated_samples >= max_samples:
+                break
+
+            remaining = max_samples - evaluated_samples
+
+            eeg = (
+                batch["eeg_spectrogram"][:remaining]
+                .unsqueeze(1)
+                .to(
+                    device,
+                    non_blocking=True,
+                )
+            )
+
+            _, true_tokens, _ = vqgan.encode(eeg)
+
+            predicted_tokens = (
+                predicted_token_grid.expand(
+                    true_tokens.shape[0],
+                    -1,
+                    -1,
+                )
+            )
+
+            update_semantic_accumulator(
+                accumulator=accumulator,
+                target_tokens=true_tokens,
+                predicted_tokens=(
+                    predicted_tokens
+                ),
+                normalized_codebook=(
+                    normalized_codebook
+                ),
+            )
+
+            evaluated_samples += eeg.shape[0]
+
+            if evaluated_samples % 25 == 0:
+                print(
+                    f"{condition_name} samples evaluated:",
+                    evaluated_samples,
+                    flush=True,
+                )
+
+    metrics = finalize_semantic_accumulator(
+        accumulator
+    )
+    metrics["evaluated_samples"] = evaluated_samples
+
+    return metrics
 
 
 def build_position_counts(
@@ -387,6 +837,7 @@ def evaluate_majority_baseline(
     position_counts,
     device,
     max_samples,
+    normalized_codebook,
 ):
     majority_tokens_flat = (
         position_counts.argmax(
@@ -434,6 +885,9 @@ def evaluate_majority_baseline(
 
     evaluated_samples = 0
     comparison_saved = False
+    semantic_accumulator = (
+        create_semantic_accumulator()
+    )
 
     output_example = None
 
@@ -487,6 +941,19 @@ def evaluate_majority_baseline(
                     64,
                 )
                 .to(device)
+            )
+
+            update_semantic_accumulator(
+                accumulator=(
+                    semantic_accumulator
+                ),
+                target_tokens=true_tokens,
+                predicted_tokens=(
+                    predicted_tokens
+                ),
+                normalized_codebook=(
+                    normalized_codebook
+                ),
             )
 
             oracle_reconstruction = (
@@ -717,6 +1184,11 @@ def evaluate_majority_baseline(
                 majority_tokens_flat
             ).numel()
         ),
+        "semantic_codebook_distance": (
+            finalize_semantic_accumulator(
+                semantic_accumulator
+            )
+        ),
     }
 
     return (
@@ -744,6 +1216,12 @@ def main():
         "--vqgan-checkpoint",
         type=Path,
         default=DEFAULT_VQGAN_CHECKPOINT,
+    )
+
+    parser.add_argument(
+        "--transformer-checkpoint",
+        type=Path,
+        default=DEFAULT_TRANSFORMER_CHECKPOINT,
     )
 
     parser.add_argument(
@@ -783,6 +1261,34 @@ def main():
         default=100,
     )
 
+    parser.add_argument(
+        "--recompute-position-counts",
+        action="store_true",
+        help=(
+            "Ignore a cached training position-count "
+            "tensor and recompute it."
+        ),
+    )
+
+    parser.add_argument(
+        "--semantic-only",
+        action="store_true",
+        help=(
+            "Run only codebook-similarity evaluation "
+            "and reuse an existing majority baseline."
+        ),
+    )
+
+    parser.add_argument(
+        "--majority-metrics",
+        type=Path,
+        default=None,
+        help=(
+            "Existing majority-baseline metrics.json "
+            "containing majority_token_grid."
+        ),
+    )
+
     args = parser.parse_args()
 
     device = torch.device(
@@ -796,6 +1302,30 @@ def main():
     vqgan, checkpoint = load_vqgan(
         args.vqgan_checkpoint,
         device,
+    )
+
+    transformer, transformer_checkpoint = (
+        load_transformer(
+            args.transformer_checkpoint,
+            device,
+        )
+    )
+
+    transformer_fold = int(
+        transformer_checkpoint["held_out_fold"]
+    )
+
+    if transformer_fold != args.held_out_fold:
+        raise ValueError(
+            "Transformer held-out fold does not match "
+            f"--held-out-fold: {transformer_fold} vs "
+            f"{args.held_out_fold}"
+        )
+
+    normalized_codebook = F.normalize(
+        vqgan.quantizer.codebook.weight.detach(),
+        p=2,
+        dim=1,
     )
 
     min_db = float(
@@ -837,6 +1367,16 @@ def main():
         )
     )
 
+    output_directory = (
+        args.output_dir
+        / f"held_out_fold_{args.held_out_fold}"
+    )
+
+    output_directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -857,6 +1397,26 @@ def main():
         ),
     )
 
+    shuffled_validation_dataset = (
+        ShuffledRespirationDataset(
+            base_dataset=validation_dataset,
+            number_of_samples=min(
+                args.max_val_samples,
+                len(validation_dataset),
+            ),
+        )
+    )
+
+    shuffled_validation_loader = DataLoader(
+        shuffled_validation_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(
+            device.type == "cuda"
+        ),
+    )
+
     print("Training folds:", train_folds)
     print(
         "Training samples:",
@@ -867,22 +1427,274 @@ def main():
         args.max_val_samples,
     )
 
-    (
-        position_counts,
-        processed_training_samples,
-    ) = build_position_counts(
-        vqgan=vqgan,
-        loader=train_loader,
-        device=device,
-        vocabulary_size=8192,
-        max_samples=(
-            args.max_train_samples
-        ),
+    if args.semantic_only:
+        majority_metrics_path = (
+            args.majority_metrics
+            if args.majority_metrics is not None
+            else (
+                DEFAULT_OUTPUT_DIR
+                / (
+                    "held_out_fold_"
+                    f"{args.held_out_fold}"
+                )
+                / "metrics.json"
+            )
+        )
+
+        if not majority_metrics_path.exists():
+            raise FileNotFoundError(
+                "Existing majority-baseline metrics "
+                "not found: "
+                f"{majority_metrics_path}. Run once "
+                "without --semantic-only or provide "
+                "--majority-metrics."
+            )
+
+        with majority_metrics_path.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            majority_summary = json.load(file)
+
+        if "majority_token_grid" not in (
+            majority_summary
+        ):
+            raise KeyError(
+                "majority_token_grid is missing from "
+                f"{majority_metrics_path}"
+            )
+
+        majority_token_grid = torch.tensor(
+            majority_summary[
+                "majority_token_grid"
+            ],
+            dtype=torch.long,
+        )
+
+        correct_semantic_metrics = (
+            evaluate_transformer_semantics(
+                transformer=transformer,
+                vqgan=vqgan,
+                loader=validation_loader,
+                device=device,
+                normalized_codebook=(
+                    normalized_codebook
+                ),
+                max_samples=args.max_val_samples,
+                condition_name=(
+                    "Correct respiration"
+                ),
+            )
+        )
+
+        shuffled_semantic_metrics = (
+            evaluate_transformer_semantics(
+                transformer=transformer,
+                vqgan=vqgan,
+                loader=shuffled_validation_loader,
+                device=device,
+                normalized_codebook=(
+                    normalized_codebook
+                ),
+                max_samples=args.max_val_samples,
+                condition_name=(
+                    "Shuffled respiration"
+                ),
+            )
+        )
+
+        majority_semantic_metrics = (
+            evaluate_fixed_token_semantics(
+                vqgan=vqgan,
+                loader=validation_loader,
+                predicted_token_grid=(
+                    majority_token_grid
+                ),
+                device=device,
+                normalized_codebook=(
+                    normalized_codebook
+                ),
+                max_samples=args.max_val_samples,
+                condition_name=(
+                    "Position-majority baseline"
+                ),
+            )
+        )
+
+        semantic_summary = {
+            "transformer_checkpoint": str(
+                args.transformer_checkpoint
+            ),
+            "vqgan_checkpoint": str(
+                args.vqgan_checkpoint
+            ),
+            "majority_metrics_source": str(
+                majority_metrics_path
+            ),
+            "held_out_fold": args.held_out_fold,
+            "max_validation_samples": (
+                args.max_val_samples
+            ),
+            "semantic_codebook_similarity": {
+                "correct_respiration": (
+                    correct_semantic_metrics
+                ),
+                "shuffled_respiration": (
+                    shuffled_semantic_metrics
+                ),
+                "position_majority_baseline": (
+                    majority_semantic_metrics
+                ),
+            },
+        }
+
+        semantic_metrics_path = (
+            output_directory
+            / "semantic_similarity.json"
+        )
+
+        with semantic_metrics_path.open(
+            "w",
+            encoding="utf-8",
+        ) as file:
+            json.dump(
+                semantic_summary,
+                file,
+                indent=2,
+            )
+
+        print()
+        print("Semantic VQ codebook similarity:")
+        print_semantic_metrics(
+            "Correct respiration",
+            correct_semantic_metrics,
+        )
+        print_semantic_metrics(
+            "Shuffled respiration",
+            shuffled_semantic_metrics,
+        )
+        print_semantic_metrics(
+            "Position-majority baseline",
+            majority_semantic_metrics,
+        )
+        print("Saved:", semantic_metrics_path)
+
+        return
+
+    position_counts_path = (
+        output_directory
+        / "training_position_counts.pt"
     )
+
+    if (
+        position_counts_path.exists()
+        and not args.recompute_position_counts
+        and args.max_train_samples is None
+    ):
+        counts_payload = torch.load(
+            position_counts_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+
+        position_counts = counts_payload[
+            "position_counts"
+        ]
+        processed_training_samples = int(
+            counts_payload[
+                "processed_training_samples"
+            ]
+        )
+
+        if int(
+            counts_payload["held_out_fold"]
+        ) != args.held_out_fold:
+            raise ValueError(
+                "Cached position counts belong to a "
+                "different held-out fold"
+            )
+
+        if (
+            position_counts.shape[1]
+            != normalized_codebook.shape[0]
+        ):
+            raise ValueError(
+                "Cached position-count vocabulary does "
+                "not match the current VQGAN codebook"
+            )
+
+        print(
+            "Loaded cached training position counts:",
+            position_counts_path,
+        )
+
+    else:
+        (
+            position_counts,
+            processed_training_samples,
+        ) = build_position_counts(
+            vqgan=vqgan,
+            loader=train_loader,
+            device=device,
+            vocabulary_size=(
+                normalized_codebook.shape[0]
+            ),
+            max_samples=(
+                args.max_train_samples
+            ),
+        )
+
+        if args.max_train_samples is None:
+            torch.save(
+                {
+                    "held_out_fold": (
+                        args.held_out_fold
+                    ),
+                    "processed_training_samples": (
+                        processed_training_samples
+                    ),
+                    "position_counts": (
+                        position_counts
+                    ),
+                },
+                position_counts_path,
+            )
 
     statistics = (
         calculate_codebook_statistics(
             position_counts
+        )
+    )
+
+    correct_semantic_metrics = (
+        evaluate_transformer_semantics(
+            transformer=transformer,
+            vqgan=vqgan,
+            loader=validation_loader,
+            device=device,
+            normalized_codebook=(
+                normalized_codebook
+            ),
+            max_samples=args.max_val_samples,
+            condition_name=(
+                "Correct respiration"
+            ),
+        )
+    )
+
+    shuffled_semantic_metrics = (
+        evaluate_transformer_semantics(
+            transformer=transformer,
+            vqgan=vqgan,
+            loader=shuffled_validation_loader,
+            device=device,
+            normalized_codebook=(
+                normalized_codebook
+            ),
+            max_samples=args.max_val_samples,
+            condition_name=(
+                "Shuffled respiration"
+            ),
         )
     )
 
@@ -900,16 +1712,9 @@ def main():
         max_samples=(
             args.max_val_samples
         ),
-    )
-
-    output_directory = (
-        args.output_dir
-        / f"held_out_fold_{args.held_out_fold}"
-    )
-
-    output_directory.mkdir(
-        parents=True,
-        exist_ok=True,
+        normalized_codebook=(
+            normalized_codebook
+        ),
     )
 
     save_comparison(
@@ -929,6 +1734,18 @@ def main():
     )
 
     summary = {
+        "transformer_checkpoint": str(
+            args.transformer_checkpoint
+        ),
+        "vqgan_checkpoint": str(
+            args.vqgan_checkpoint
+        ),
+        "transformer_architecture": (
+            transformer_checkpoint.get(
+                "architecture",
+                "joint_concatenated_transformer",
+            )
+        ),
         "held_out_fold": (
             args.held_out_fold
         ),
@@ -971,6 +1788,19 @@ def main():
             .reshape(8, 64)
             .tolist()
         ),
+        "semantic_codebook_similarity": {
+            "correct_respiration": (
+                correct_semantic_metrics
+            ),
+            "shuffled_respiration": (
+                shuffled_semantic_metrics
+            ),
+            "position_majority_baseline": (
+                baseline_metrics[
+                    "semantic_codebook_distance"
+                ]
+            ),
+        },
     }
 
     metrics_path = (
@@ -1064,6 +1894,23 @@ def main():
         (
             baseline_metrics["unique_majority_codes"]
         ),
+    )
+
+    print()
+    print("Semantic VQ codebook similarity:")
+    print_semantic_metrics(
+        "Correct respiration",
+        correct_semantic_metrics,
+    )
+    print_semantic_metrics(
+        "Shuffled respiration",
+        shuffled_semantic_metrics,
+    )
+    print_semantic_metrics(
+        "Position-majority baseline",
+        baseline_metrics[
+            "semantic_codebook_distance"
+        ],
     )
     print("Saved:", metrics_path)
 

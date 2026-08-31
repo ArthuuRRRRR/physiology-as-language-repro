@@ -14,14 +14,15 @@ if str(PROJECT_ROOT) not in sys.path:
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
-
-from src.data.dataset import PhysiologyPairDataset
-from src.models.mage_transformer import (
-    MAGERespirationToEEGTransformer,
+from torch.utils.data import (
+    DataLoader,
+    Subset,
+    WeightedRandomSampler,
 )
 
+from src.data.dataset import PhysiologyPairDataset
 from src.models.masked_transformer import (
+    RespirationToEEGTransformer,
     mask_eeg_tokens,
 )
 from src.models.vqgan import VQGAN
@@ -37,8 +38,11 @@ DEFAULT_VQGAN_CHECKPOINT = Path(
 )
 
 DEFAULT_OUTPUT_DIR = Path(
-    "outputs/masked_transformer_joint"
+    "outputs/masked_transformer_codebook_v3"
 )
+
+MODEL_WINDOW_SEC = 256 * 60
+SUPPORTED_WINDOW_INDICES = (0, 1)
 
 
 def set_seed(seed):
@@ -141,13 +145,22 @@ def load_initial_transformer(
         "architecture"
     )
 
-    if architecture not in (
-        None,
-        "mage_visible_encoder_decoder",
+    if architecture != (
+        "joint_codebook_tied_transformer_v3"
     ):
         raise ValueError(
             "Incompatible checkpoint architecture: "
             f"{architecture}"
+        )
+
+    checkpoint_model_config = checkpoint.get(
+        "model_config"
+    )
+
+    if checkpoint_model_config != model.get_config():
+        raise ValueError(
+            "Initial checkpoint model_config does not "
+            "match the requested V3 model"
         )
 
     checkpoint_fold = checkpoint.get(
@@ -216,6 +229,304 @@ def create_datasets(
         validation_dataset,
         train_folds,
     )
+
+
+def filter_supported_windows(
+    dataset,
+    supported_windows=SUPPORTED_WINDOW_INDICES,
+):
+    """Keep window000/window001 and return aligned window IDs."""
+
+    selected_indices = []
+    selected_window_indices = []
+    counts = {
+        int(window_index): 0
+        for window_index in supported_windows
+    }
+
+    if not hasattr(dataset, "files"):
+        raise TypeError(
+            "Window filtering requires a dataset with a files list"
+        )
+
+    for dataset_index, file_path in enumerate(
+        dataset.files
+    ):
+        with np.load(file_path) as sample:
+            if "start_sec" not in sample:
+                raise KeyError(
+                    "start_sec is required for window-aware training: "
+                    f"{file_path}"
+                )
+
+            start_sec = int(
+                round(
+                    float(
+                        np.asarray(
+                            sample["start_sec"]
+                        ).reshape(-1)[0]
+                    )
+                )
+            )
+
+        window_index = (
+            start_sec // MODEL_WINDOW_SEC
+        )
+
+        if window_index not in supported_windows:
+            continue
+
+        selected_indices.append(dataset_index)
+        selected_window_indices.append(
+            int(window_index)
+        )
+        counts[int(window_index)] += 1
+
+    for window_index in supported_windows:
+        if counts[int(window_index)] < 1:
+            raise RuntimeError(
+                "No samples found for supported window "
+                f"{window_index}"
+            )
+
+    return (
+        Subset(dataset, selected_indices),
+        selected_window_indices,
+        counts,
+    )
+
+
+def create_balanced_window_sampler(
+    window_indices,
+    seed,
+):
+    """Create an approximately 50/50 sampler for windows 0 and 1."""
+
+    counts = {
+        window_index: window_indices.count(
+            window_index
+        )
+        for window_index in SUPPORTED_WINDOW_INDICES
+    }
+
+    weights = torch.tensor(
+        [
+            1.0 / counts[window_index]
+            for window_index in window_indices
+        ],
+        dtype=torch.double,
+    )
+
+    samples_per_epoch = 2 * max(
+        counts.values()
+    )
+
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+
+    sampler = WeightedRandomSampler(
+        weights=weights,
+        num_samples=samples_per_epoch,
+        replacement=True,
+        generator=generator,
+    )
+
+    return sampler, samples_per_epoch
+
+
+def window_indices_from_batch(
+    batch,
+    device,
+):
+    """Convert start_sec metadata into window indices 0 or 1."""
+
+    if "start_sec" not in batch:
+        raise KeyError(
+            "start_sec is missing from a training batch"
+        )
+
+    start_sec = torch.as_tensor(
+        batch["start_sec"],
+        device=device,
+    ).reshape(-1)
+
+    window_indices = torch.div(
+        start_sec.round().long(),
+        MODEL_WINDOW_SEC,
+        rounding_mode="floor",
+    )
+
+    supported = torch.zeros_like(
+        window_indices,
+        dtype=torch.bool,
+    )
+
+    for window_index in SUPPORTED_WINDOW_INDICES:
+        supported |= (
+            window_indices == window_index
+        )
+
+    if not supported.all():
+        raise ValueError(
+            "Unsupported window index in batch: "
+            f"{window_indices.detach().cpu().tolist()}"
+        )
+
+    return window_indices
+
+
+def calculate_training_losses(
+    logits,
+    predicted_latents,
+    target_tokens,
+    mask,
+    normalized_codebook,
+    semantic_loss_weight,
+    temporal_loss_weight,
+    temporal_cosine_weight,
+):
+    """Calculate tied-codebook CE and direct latent losses."""
+
+    batch_size = target_tokens.shape[0]
+    grid_height = target_tokens.shape[1]
+    grid_width = target_tokens.shape[2]
+
+    targets_flat = target_tokens.flatten(
+        start_dim=1
+    )
+    mask_flat = mask.flatten(start_dim=1)
+
+    masked_logits = logits[mask_flat]
+    masked_targets = targets_flat[mask_flat]
+
+    cross_entropy_loss = F.cross_entropy(
+        masked_logits,
+        masked_targets,
+    )
+
+    # Compute latent losses in float32 even when the
+    # Transformer forward pass uses mixed precision.
+    predicted_latents_float = (
+        predicted_latents.float()
+    )
+    codebook_float = normalized_codebook.float()
+
+    target_vectors = F.embedding(
+        targets_flat,
+        codebook_float,
+    )
+
+    predicted_unit = F.normalize(
+        predicted_latents_float,
+        p=2,
+        dim=-1,
+        eps=1e-6,
+    )
+
+    target_unit = F.normalize(
+        target_vectors,
+        p=2,
+        dim=-1,
+        eps=1e-6,
+    )
+
+    semantic_cosine = (
+        predicted_unit * target_unit
+    ).sum(dim=-1)
+
+    semantic_loss = (
+        1.0 - semantic_cosine[mask_flat]
+    ).mean()
+
+    latent_dim = predicted_unit.shape[-1]
+
+    predicted_grid = predicted_unit.reshape(
+        batch_size,
+        grid_height,
+        grid_width,
+        latent_dim,
+    )
+
+    target_grid = target_unit.reshape(
+        batch_size,
+        grid_height,
+        grid_width,
+        latent_dim,
+    )
+
+    predicted_delta = (
+        predicted_grid[:, :, 1:, :]
+        - predicted_grid[:, :, :-1, :]
+    )
+
+    target_delta = (
+        target_grid[:, :, 1:, :]
+        - target_grid[:, :, :-1, :]
+    )
+
+    temporal_mask = (
+        mask[:, :, 1:]
+        & mask[:, :, :-1]
+    )
+
+    target_delta_norm = torch.linalg.vector_norm(
+        target_delta,
+        ord=2,
+        dim=-1,
+    )
+
+    temporal_mask &= target_delta_norm > 1e-6
+
+    if temporal_mask.any():
+        temporal_smooth_l1 = F.smooth_l1_loss(
+            predicted_delta[temporal_mask],
+            target_delta[temporal_mask],
+        )
+
+        temporal_cosine = F.cosine_similarity(
+            predicted_delta,
+            target_delta,
+            dim=-1,
+            eps=1e-6,
+        )
+
+        temporal_cosine_loss = (
+            1.0
+            - temporal_cosine[temporal_mask]
+        ).mean()
+
+        temporal_loss = (
+            temporal_smooth_l1
+            + temporal_cosine_weight
+            * temporal_cosine_loss
+        )
+
+    else:
+        zero = predicted_latents_float.sum() * 0.0
+        temporal_smooth_l1 = zero
+        temporal_cosine_loss = zero
+        temporal_loss = zero
+
+    total_loss = (
+        cross_entropy_loss
+        + semantic_loss_weight * semantic_loss
+        + temporal_loss_weight * temporal_loss
+    )
+
+    return {
+        "total": total_loss,
+        "cross_entropy": cross_entropy_loss,
+        "semantic": semantic_loss,
+        "temporal": temporal_loss,
+        "temporal_smooth_l1": (
+            temporal_smooth_l1
+        ),
+        "temporal_cosine": (
+            temporal_cosine_loss
+        ),
+        "masked_logits": masked_logits,
+        "masked_targets": masked_targets,
+    }
 
 
 def standardize_respiration(
@@ -304,10 +615,15 @@ def run_epoch(
     vqgan,
     loader,
     device,
+    normalized_codebook,
+    semantic_loss_weight=0.5,
+    temporal_loss_weight=1.0,
+    temporal_cosine_weight=0.25,
     optimizer=None,
     scaler=None,
     gradient_accumulation_steps=1,
-    full_mask_probability=0.5,
+    max_grad_norm=1.0,
+    full_mask_probability=1.0,
     max_batches=None,
     log_every=500,
 ):
@@ -343,11 +659,28 @@ def run_epoch(
         )
 
     total_loss = 0.0
+    total_cross_entropy_loss = 0.0
+    total_semantic_loss = 0.0
+    total_temporal_loss = 0.0
+    total_temporal_smooth_l1 = 0.0
+    total_temporal_cosine_loss = 0.0
     total_correct = 0
     total_top5 = 0
     total_positions = 0
     total_mask_ratio = 0.0
     processed_batches = 0
+    successful_optimizer_updates = 0
+    skipped_optimizer_updates = 0
+    predicted_code_seen = torch.zeros(
+        model.codebook_size,
+        dtype=torch.bool,
+        device=device,
+    )
+    target_code_seen = torch.zeros(
+        model.codebook_size,
+        dtype=torch.bool,
+        device=device,
+    )
 
     for batch_index, batch in enumerate(
         loader,
@@ -375,6 +708,11 @@ def run_epoch(
 
         respiration = standardize_respiration(
             respiration
+        )
+
+        window_indices = window_indices_from_batch(
+            batch,
+            device,
         )
 
         # The VQGAN is frozen and only creates target tokens.
@@ -415,37 +753,51 @@ def run_epoch(
                 device=device,
             )
 
-        targets_flat = eeg_tokens.flatten(
-            start_dim=1
-        )
-
-        mask_flat = mask.flatten(
-            start_dim=1
-        )
-
         with torch.set_grad_enabled(training):
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.float16,
                 enabled=(device.type == "cuda"),
             ):
-                logits = model(
+                (
+                    logits,
+                    predicted_latents,
+                ) = model(
                     respiration,
                     masked_tokens,
+                    window_index=window_indices,
+                    codebook=normalized_codebook,
+                    return_latents=True,
                 )
 
-                masked_logits = logits[
-                    mask_flat
-                ]
+            losses = calculate_training_losses(
+                logits=logits,
+                predicted_latents=(
+                    predicted_latents
+                ),
+                target_tokens=eeg_tokens,
+                mask=mask,
+                normalized_codebook=(
+                    normalized_codebook
+                ),
+                semantic_loss_weight=(
+                    semantic_loss_weight
+                ),
+                temporal_loss_weight=(
+                    temporal_loss_weight
+                ),
+                temporal_cosine_weight=(
+                    temporal_cosine_weight
+                ),
+            )
 
-                masked_targets = targets_flat[
-                    mask_flat
-                ]
-
-                loss = F.cross_entropy(
-                    masked_logits,
-                    masked_targets,
-                )
+            loss = losses["total"]
+            masked_logits = losses[
+                "masked_logits"
+            ]
+            masked_targets = losses[
+                "masked_targets"
+            ]
 
         if not torch.isfinite(loss):
             raise ValueError(
@@ -477,8 +829,32 @@ def run_epoch(
             )
 
             if should_update:
+                scaler.unscale_(optimizer)
+
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=max_grad_norm,
+                )
+
+                scale_before_update = (
+                    scaler.get_scale()
+                )
+
                 scaler.step(optimizer)
                 scaler.update()
+
+                scale_after_update = (
+                    scaler.get_scale()
+                )
+
+                if (
+                    scale_after_update
+                    < scale_before_update
+                ):
+                    skipped_optimizer_updates += 1
+
+                else:
+                    successful_optimizer_updates += 1
 
                 optimizer.zero_grad(
                     set_to_none=True
@@ -517,9 +893,46 @@ def run_epoch(
                 * number_of_positions
             )
 
+            total_cross_entropy_loss += (
+                losses["cross_entropy"].item()
+                * number_of_positions
+            )
+
+            total_semantic_loss += (
+                losses["semantic"].item()
+                * number_of_positions
+            )
+
+            total_temporal_loss += (
+                losses["temporal"].item()
+                * number_of_positions
+            )
+
+            total_temporal_smooth_l1 += (
+                losses[
+                    "temporal_smooth_l1"
+                ].item()
+                * number_of_positions
+            )
+
+            total_temporal_cosine_loss += (
+                losses[
+                    "temporal_cosine"
+                ].item()
+                * number_of_positions
+            )
+
             total_correct += correct.item()
             total_top5 += top5_correct.item()
             total_positions += number_of_positions
+
+            predicted_code_seen[
+                predictions.unique()
+            ] = True
+
+            target_code_seen[
+                masked_targets.unique()
+            ] = True
 
             total_mask_ratio += (
                 mask_ratios.mean().item()
@@ -544,7 +957,17 @@ def run_epoch(
 
             print(
                 f"  {mode} batch {batch_index}"
-                f" | loss={running_loss:.4f}",
+                f" | loss={running_loss:.4f}"
+                " | ce="
+                f"{total_cross_entropy_loss / total_positions:.4f}"
+                " | semantic="
+                f"{total_semantic_loss / total_positions:.4f}"
+                " | temporal="
+                f"{total_temporal_loss / total_positions:.4f}"
+                " | temp_l1="
+                f"{total_temporal_smooth_l1 / total_positions:.4f}"
+                " | temp_cos="
+                f"{total_temporal_cosine_loss / total_positions:.4f}",
                 flush=True,
             )
 
@@ -553,9 +976,39 @@ def run_epoch(
             "No batch was processed"
         )
 
+    if (
+        training
+        and successful_optimizer_updates == 0
+    ):
+        raise RuntimeError(
+            "Every optimizer update was skipped by AMP. "
+            "The gradients are non-finite; do not start "
+            "the full training run."
+        )
+
     return {
         "loss": (
             total_loss
+            / total_positions
+        ),
+        "cross_entropy_loss": (
+            total_cross_entropy_loss
+            / total_positions
+        ),
+        "semantic_loss": (
+            total_semantic_loss
+            / total_positions
+        ),
+        "temporal_loss": (
+            total_temporal_loss
+            / total_positions
+        ),
+        "temporal_smooth_l1_loss": (
+            total_temporal_smooth_l1
+            / total_positions
+        ),
+        "temporal_cosine_loss": (
+            total_temporal_cosine_loss
             / total_positions
         ),
         "accuracy": (
@@ -570,8 +1023,20 @@ def run_epoch(
             total_mask_ratio
             / processed_batches
         ),
+        "unique_predicted_codes": int(
+            predicted_code_seen.sum().item()
+        ),
+        "unique_target_codes": int(
+            target_code_seen.sum().item()
+        ),
         "positions": total_positions,
         "batches": processed_batches,
+        "optimizer_updates": (
+            successful_optimizer_updates
+        ),
+        "skipped_optimizer_updates": (
+            skipped_optimizer_updates
+        ),
     }
 
 
@@ -608,12 +1073,12 @@ def main():
         required=True,
     )
     parser.add_argument(
-    "--overfit-samples",
-    type=int,
-    default=None,
-    help=(
-        "Diagnostic: train and validate on the same "
-        "small fixed subset."
+        "--overfit-samples",
+        type=int,
+        default=None,
+        help=(
+            "Diagnostic: train and validate on the same "
+            "small fixed subset."
         ),
     )
 
@@ -647,6 +1112,12 @@ def main():
     )
 
     parser.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=1.0,
+    )
+
+    parser.add_argument(
         "--num-workers",
         type=int,
         default=4,
@@ -673,11 +1144,71 @@ def main():
     parser.add_argument(
         "--full-mask-probability",
         type=float,
-        default=0.00,
+        default=1.00,
         help=(
             "Probability that all EEG tokens of a "
             "training example are masked."
         ),
+    )
+
+    parser.add_argument(
+        "--semantic-loss-weight",
+        type=float,
+        default=0.50,
+    )
+
+    parser.add_argument(
+        "--temporal-loss-weight",
+        type=float,
+        default=1.00,
+    )
+
+    parser.add_argument(
+        "--temporal-cosine-weight",
+        type=float,
+        default=0.25,
+    )
+
+    parser.add_argument(
+        "--codebook-temperature",
+        type=float,
+        default=0.07,
+    )
+
+    parser.add_argument(
+        "--embedding-dim",
+        type=int,
+        default=384,
+    )
+
+    parser.add_argument(
+        "--num-heads",
+        type=int,
+        default=6,
+    )
+
+    parser.add_argument(
+        "--num-encoder-layers",
+        type=int,
+        default=4,
+    )
+
+    parser.add_argument(
+        "--num-decoder-layers",
+        type=int,
+        default=4,
+    )
+
+    parser.add_argument(
+        "--mlp-ratio",
+        type=int,
+        default=4,
+    )
+
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.1,
     )
 
     parser.add_argument(
@@ -722,6 +1253,11 @@ def main():
             "must be at least 1"
         )
 
+    if args.max_grad_norm <= 0:
+        raise ValueError(
+            "max-grad-norm must be positive"
+        )
+
     if not (
         0.0
         <= args.full_mask_probability
@@ -730,6 +1266,61 @@ def main():
         raise ValueError(
             "full-mask-probability must be "
             "between 0 and 1"
+        )
+
+    if args.semantic_loss_weight < 0:
+        raise ValueError(
+            "semantic-loss-weight cannot be negative"
+        )
+
+    if args.temporal_loss_weight < 0:
+        raise ValueError(
+            "temporal-loss-weight cannot be negative"
+        )
+
+    if args.temporal_cosine_weight < 0:
+        raise ValueError(
+            "temporal-cosine-weight cannot be negative"
+        )
+
+    if args.codebook_temperature <= 0:
+        raise ValueError(
+            "codebook-temperature must be positive"
+        )
+
+    if args.embedding_dim < 1:
+        raise ValueError(
+            "embedding-dim must be positive"
+        )
+
+    if args.num_heads < 1:
+        raise ValueError(
+            "num-heads must be positive"
+        )
+
+    if args.num_encoder_layers < 1:
+        raise ValueError(
+            "num-encoder-layers must be positive"
+        )
+
+    if args.num_decoder_layers < 1:
+        raise ValueError(
+            "num-decoder-layers must be positive"
+        )
+
+    if args.mlp_ratio < 1:
+        raise ValueError(
+            "mlp-ratio must be positive"
+        )
+
+    if args.embedding_dim % args.num_heads != 0:
+        raise ValueError(
+            "embedding-dim must be divisible by num-heads"
+        )
+
+    if not 0.0 <= args.dropout < 1.0:
+        raise ValueError(
+            "dropout must be in [0, 1)"
         )
 
     set_seed(args.seed)
@@ -781,6 +1372,28 @@ def main():
         min_db=min_db,
         max_db=max_db,
     )
+
+    (
+        train_dataset,
+        train_window_indices,
+        train_window_counts,
+    ) = filter_supported_windows(
+        train_dataset
+    )
+
+    (
+        validation_dataset,
+        validation_window_indices,
+        validation_window_counts,
+    ) = filter_supported_windows(
+        validation_dataset
+    )
+
+    train_sampler = None
+    samples_per_training_epoch = len(
+        train_dataset
+    )
+
     if args.overfit_samples is not None:
         if args.overfit_samples < 1:
             raise ValueError(
@@ -799,6 +1412,11 @@ def main():
 
         train_dataset = overfit_dataset
         validation_dataset = overfit_dataset
+        train_window_indices = (
+            train_window_indices[
+                :number_of_samples
+            ]
+        )
 
         print(
             "Overfitting diagnostic:",
@@ -806,10 +1424,22 @@ def main():
             "identical training/validation samples",
         )
 
+    else:
+        (
+            train_sampler,
+            samples_per_training_epoch,
+        ) = create_balanced_window_sampler(
+            window_indices=(
+                train_window_indices
+            ),
+            seed=args.seed,
+        )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
         persistent_workers=(
@@ -828,9 +1458,35 @@ def main():
         ),
     )
 
-    model = (
-        MAGERespirationToEEGTransformer()
-        .to(device)
+    model = RespirationToEEGTransformer(
+        codebook_size=(
+            vqgan.quantizer.codebook.weight.shape[0]
+        ),
+        embedding_dim=args.embedding_dim,
+        num_heads=args.num_heads,
+        num_encoder_layers=(
+            args.num_encoder_layers
+        ),
+        num_decoder_layers=(
+            args.num_decoder_layers
+        ),
+        mlp_ratio=args.mlp_ratio,
+        dropout=args.dropout,
+        num_window_types=2,
+        use_window_embedding=True,
+        codebook_dim=(
+            vqgan.quantizer.codebook.weight.shape[1]
+        ),
+        use_codebook_tied_output=True,
+        codebook_temperature=(
+            args.codebook_temperature
+        ),
+    ).to(device)
+
+    normalized_codebook = F.normalize(
+        vqgan.quantizer.codebook.weight.detach(),
+        p=2,
+        dim=1,
     )
 
     initial_checkpoint = (
@@ -875,12 +1531,20 @@ def main():
 
     print("Device:", device)
     print(
-        "Model: MAGE-style visible-token encoder-decoder"
+        "Model: codebook-tied latent Transformer V3"
     )
     print("Training folds:", train_folds)
     print(
         "Training samples:",
         len(train_dataset),
+    )
+    print(
+        "Balanced samples per training epoch:",
+        samples_per_training_epoch,
+    )
+    print(
+        "Training windows before balancing:",
+        train_window_counts,
     )
     print(
         "Held-out fold:",
@@ -889,6 +1553,10 @@ def main():
     print(
         "Validation samples:",
         len(validation_dataset),
+    )
+    print(
+        "Validation windows:",
+        validation_window_counts,
     )
     print(
         "Normalization:",
@@ -907,12 +1575,30 @@ def main():
         args.gradient_accumulation_steps,
     )
     print(
+        "Maximum gradient norm:",
+        args.max_grad_norm,
+    )
+    print(
         "Effective batch size:",
         effective_batch_size,
     )
     print(
         "Full-mask probability:",
         args.full_mask_probability,
+    )
+    print(
+        "Loss weights: CE=1.0 | latent semantic=",
+        args.semantic_loss_weight,
+        "| temporal=",
+        args.temporal_loss_weight,
+    )
+    print(
+        "Temporal cosine weight:",
+        args.temporal_cosine_weight,
+    )
+    print(
+        "Initial codebook temperature:",
+        args.codebook_temperature,
     )
     print(
         "Learning rate:",
@@ -948,11 +1634,24 @@ def main():
             vqgan=vqgan,
             loader=train_loader,
             device=device,
+            normalized_codebook=(
+                normalized_codebook
+            ),
+            semantic_loss_weight=(
+                args.semantic_loss_weight
+            ),
+            temporal_loss_weight=(
+                args.temporal_loss_weight
+            ),
+            temporal_cosine_weight=(
+                args.temporal_cosine_weight
+            ),
             optimizer=optimizer,
             scaler=scaler,
             gradient_accumulation_steps=(
                 args.gradient_accumulation_steps
             ),
+            max_grad_norm=args.max_grad_norm,
             full_mask_probability=(
                 args.full_mask_probability
             ),
@@ -967,6 +1666,18 @@ def main():
             vqgan=vqgan,
             loader=validation_loader,
             device=device,
+            normalized_codebook=(
+                normalized_codebook
+            ),
+            semantic_loss_weight=(
+                args.semantic_loss_weight
+            ),
+            temporal_loss_weight=(
+                args.temporal_loss_weight
+            ),
+            temporal_cosine_weight=(
+                args.temporal_cosine_weight
+            ),
             max_batches=(
                 args.max_val_batches
             ),
@@ -980,24 +1691,53 @@ def main():
             f" | lr={learning_rate:.2e}"
             f" | train_loss="
             f"{train_metrics['loss']:.4f}"
+            f" | train_ce="
+            f"{train_metrics['cross_entropy_loss']:.4f}"
+            f" | train_sem="
+            f"{train_metrics['semantic_loss']:.4f}"
+            f" | train_temp="
+            f"{train_metrics['temporal_loss']:.4f}"
+            f" | train_temp_l1="
+            f"{train_metrics['temporal_smooth_l1_loss']:.4f}"
+            f" | train_temp_cos="
+            f"{train_metrics['temporal_cosine_loss']:.4f}"
             f" | train_acc="
             f"{train_metrics['accuracy']:.4f}"
+            f" | train_codes="
+            f"{train_metrics['unique_predicted_codes']}"
+            f" | updates="
+            f"{train_metrics['optimizer_updates']}"
+            f" | skipped="
+            f"{train_metrics['skipped_optimizer_updates']}"
             f" | train_mask="
             f"{train_metrics['mask_ratio']:.4f}"
             f" | val_loss="
             f"{validation_metrics['loss']:.4f}"
+            f" | val_ce="
+            f"{validation_metrics['cross_entropy_loss']:.4f}"
+            f" | val_sem="
+            f"{validation_metrics['semantic_loss']:.4f}"
+            f" | val_temp="
+            f"{validation_metrics['temporal_loss']:.4f}"
+            f" | val_temp_l1="
+            f"{validation_metrics['temporal_smooth_l1_loss']:.4f}"
+            f" | val_temp_cos="
+            f"{validation_metrics['temporal_cosine_loss']:.4f}"
             f" | val_acc="
             f"{validation_metrics['accuracy']:.4f}"
+            f" | val_codes="
+            f"{validation_metrics['unique_predicted_codes']}"
             f" | val_top5="
             f"{validation_metrics['top5_accuracy']:.4f}",
             flush=True,
         )
 
         checkpoint = {
-            "version": 3,
+            "version": 5,
             "architecture": (
-                "mage_visible_encoder_decoder"
+                "joint_codebook_tied_transformer_v3"
             ),
+            "model_config": model.get_config(),
             "epoch": epoch_number,
             "held_out_fold": (
                 args.held_out_fold
@@ -1009,8 +1749,35 @@ def main():
             "weight_decay": (
                 args.weight_decay
             ),
+            "max_grad_norm": (
+                args.max_grad_norm
+            ),
             "full_mask_probability": (
                 args.full_mask_probability
+            ),
+            "semantic_loss_weight": (
+                args.semantic_loss_weight
+            ),
+            "temporal_loss_weight": (
+                args.temporal_loss_weight
+            ),
+            "temporal_cosine_weight": (
+                args.temporal_cosine_weight
+            ),
+            "codebook_temperature": (
+                args.codebook_temperature
+            ),
+            "supported_window_indices": list(
+                SUPPORTED_WINDOW_INDICES
+            ),
+            "train_window_counts": (
+                train_window_counts
+            ),
+            "validation_window_counts": (
+                validation_window_counts
+            ),
+            "balanced_samples_per_epoch": (
+                samples_per_training_epoch
             ),
             "initial_checkpoint": (
                 str(args.initial_checkpoint)
