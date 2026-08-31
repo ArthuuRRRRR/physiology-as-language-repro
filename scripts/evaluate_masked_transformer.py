@@ -3,6 +3,7 @@
 import argparse
 import itertools
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -564,6 +565,253 @@ def standardize_respiration(
     ) / (std + eps)
 
 
+def generate_eeg_tokens(
+    transformer,
+    respiration,
+    initial_tokens,
+    mask_token_id,
+    iterative_steps,
+    forward_kwargs,
+):
+    """
+    Generate a complete EEG token grid by confidence-based
+    iterative masked decoding.
+
+    The one-step case is exactly the legacy evaluation: all
+    positions are predicted once from a fully masked grid.
+
+    For multiple steps, every pass predicts all positions that
+    remain masked.  The most confident predictions are committed,
+    while the least confident positions remain masked according to
+    a cosine schedule.  Previously committed tokens are fed back to
+    the Transformer as context on the next pass.
+
+    Cross-entropy logits are stored when each token is committed.
+    Consequently, already visible predictions are never scored from
+    logits that can directly attend to their own token identity.
+
+    Returns
+    -------
+    generated_tokens : torch.Tensor
+        Final token grid with the same shape as initial_tokens.
+    committed_logits : torch.Tensor
+        Logits from the pass where each output token was committed,
+        with shape (B, num_eeg_tokens, codebook_size).
+    remaining_mask_counts : list[int]
+        Number of masked positions left after every decoding pass.
+    """
+
+    if iterative_steps < 1:
+        raise ValueError(
+            "iterative_steps must be at least 1"
+        )
+
+    current_tokens = initial_tokens.clone()
+
+    if not torch.all(
+        current_tokens == mask_token_id
+    ):
+        raise ValueError(
+            "Iterative evaluation expects a fully masked "
+            "initial EEG token grid"
+        )
+
+    batch_size = current_tokens.shape[0]
+    tokens_per_sample = (
+        current_tokens[0].numel()
+    )
+
+    committed_logits = None
+    committed_positions = torch.zeros(
+        batch_size,
+        tokens_per_sample,
+        dtype=torch.bool,
+        device=current_tokens.device,
+    )
+
+    remaining_mask_counts = []
+
+    for step_index in range(iterative_steps):
+        logits = transformer(
+            respiration,
+            current_tokens,
+            **forward_kwargs,
+        )
+
+        if (
+            logits.ndim != 3
+            or logits.shape[0] != batch_size
+            or logits.shape[1] != tokens_per_sample
+        ):
+            raise ValueError(
+                "Unexpected Transformer output shape during "
+                "iterative decoding: "
+                f"{tuple(logits.shape)}"
+            )
+
+        if committed_logits is None:
+            committed_logits = torch.empty_like(
+                logits
+            )
+
+        current_flat = current_tokens.flatten(
+            start_dim=1
+        )
+
+        current_mask = (
+            current_flat == mask_token_id
+        )
+
+        if not current_mask.any():
+            raise RuntimeError(
+                "No masked EEG position remains before the "
+                "last iterative decoding pass"
+            )
+
+        candidate_tokens = logits.argmax(
+            dim=-1
+        )
+
+        # Softmax confidence is used only to rank positions.
+        # Token selection itself remains deterministic argmax.
+        confidence = F.softmax(
+            logits.float(),
+            dim=-1,
+        ).amax(dim=-1)
+
+        if not torch.isfinite(confidence).all():
+            raise FloatingPointError(
+                "Non-finite confidence during iterative decoding"
+            )
+
+        if step_index == iterative_steps - 1:
+            scheduled_remaining = 0
+
+        else:
+            progress = (
+                (step_index + 1)
+                / iterative_steps
+            )
+
+            mask_ratio = math.cos(
+                0.5 * math.pi * progress
+            )
+
+            scheduled_remaining = int(
+                round(
+                    tokens_per_sample
+                    * mask_ratio
+                )
+            )
+
+        next_mask = torch.zeros_like(
+            current_mask
+        )
+
+        for sample_index in range(batch_size):
+            current_count = int(
+                current_mask[sample_index]
+                .sum()
+                .item()
+            )
+
+            if step_index == iterative_steps - 1:
+                remaining_count = 0
+
+            else:
+                # Guarantee that at least one new position is
+                # committed on every non-final pass.
+                remaining_count = min(
+                    scheduled_remaining,
+                    max(current_count - 1, 0),
+                )
+
+            if remaining_count > 0:
+                eligible_confidence = confidence[
+                    sample_index
+                ].masked_fill(
+                    ~current_mask[sample_index],
+                    float("inf"),
+                )
+
+                low_confidence_indices = torch.topk(
+                    eligible_confidence,
+                    k=remaining_count,
+                    largest=False,
+                ).indices
+
+                next_mask[
+                    sample_index,
+                    low_confidence_indices,
+                ] = True
+
+        newly_committed = (
+            current_mask & ~next_mask
+        )
+
+        if not newly_committed.any():
+            raise RuntimeError(
+                "Iterative decoding did not commit any token"
+            )
+
+        committed_logits[newly_committed] = (
+            logits[newly_committed]
+        )
+
+        committed_positions |= newly_committed
+
+        next_tokens_flat = current_flat.clone()
+        next_tokens_flat[current_mask] = (
+            candidate_tokens[current_mask]
+        )
+        next_tokens_flat[next_mask] = mask_token_id
+
+        current_tokens = next_tokens_flat.view_as(
+            current_tokens
+        )
+
+        counts = next_mask.sum(dim=1)
+
+        if not torch.equal(
+            counts,
+            counts[:1].expand_as(counts),
+        ):
+            raise RuntimeError(
+                "Different samples retained different numbers "
+                "of masks"
+            )
+
+        remaining_mask_counts.append(
+            int(counts[0].item())
+        )
+
+    if (
+        (current_tokens == mask_token_id).any()
+        or not committed_positions.all()
+    ):
+        raise RuntimeError(
+            "Iterative decoding ended with uncommitted tokens"
+        )
+
+    generated_flat = current_tokens.flatten(
+        start_dim=1
+    )
+
+    if not torch.equal(
+        generated_flat,
+        committed_logits.argmax(dim=-1),
+    ):
+        raise RuntimeError(
+            "Generated tokens and commit-step logits disagree"
+        )
+
+    return (
+        current_tokens,
+        committed_logits,
+        remaining_mask_counts,
+    )
+
+
 def decode_token_ids(
     vqgan,
     token_ids,
@@ -907,6 +1155,7 @@ def save_comparison(
     output_path,
     zero_respiration,
     shuffle_respiration,
+    iterative_steps,
 ):
     """
     Save a visual comparison for the first sample.
@@ -954,6 +1203,13 @@ def save_comparison(
         prediction_title = (
             "EEG reconstructed from "
             "correct synchronized respiration"
+        )
+
+    if iterative_steps > 1:
+        prediction_title += (
+            "\n"
+            f"({iterative_steps}-step confidence-based "
+            "iterative decoding)"
         )
 
     fig, axes = plt.subplots(
@@ -1066,6 +1322,18 @@ def main():
     )
 
     parser.add_argument(
+        "--iterative-steps",
+        type=int,
+        default=1,
+        help=(
+            "Number of confidence-based masked decoding "
+            "passes. The default 1 reproduces the legacy "
+            "one-shot evaluation; use 12 for the main "
+            "iterative diagnostic."
+        ),
+    )
+
+    parser.add_argument(
         "--paired-windows",
         action="store_true",
         help=(
@@ -1102,6 +1370,11 @@ def main():
     if args.max_samples < 1:
         raise ValueError(
             "max-samples must be at least 1"
+        )
+
+    if args.iterative_steps < 1:
+        raise ValueError(
+            "iterative-steps must be at least 1"
         )
 
     if not (
@@ -1155,6 +1428,12 @@ def main():
         else:
             suffix = "evaluation"
 
+        if args.iterative_steps > 1:
+            suffix += (
+                "_iterative_"
+                f"{args.iterative_steps}steps"
+            )
+
         output_dir = (
             args.transformer_checkpoint.parent
             / suffix
@@ -1192,6 +1471,21 @@ def main():
             "unknown",
         ),
     )
+
+    if transformer_checkpoint.get(
+        "architecture"
+    ) == "time_aligned_codebook_transformer_v6":
+        print(
+            "Aligned gates:",
+            "input=",
+            transformer_checkpoint.get(
+                "aligned_input_gate"
+            ),
+            "| output=",
+            transformer_checkpoint.get(
+                "aligned_output_gate"
+            ),
+        )
     print(
         "Zero respiration:",
         args.zero_respiration,
@@ -1204,6 +1498,18 @@ def main():
     print(
         "Paired windows:",
         args.paired_windows,
+    )
+    print(
+        "Decoding mode:",
+        (
+            "one-shot"
+            if args.iterative_steps == 1
+            else "iterative confidence-based"
+        ),
+    )
+    print(
+        "Iterative steps:",
+        args.iterative_steps,
     )
 
     validation_directory = (
@@ -1269,14 +1575,18 @@ def main():
         "joint_concatenated_transformer",
     )
 
-    if architecture == "joint_codebook_tied_transformer_v3":
+    if architecture in (
+        "joint_codebook_tied_transformer_v3",
+        "time_aligned_codebook_transformer_v6",
+    ):
         model_config = transformer_checkpoint.get(
             "model_config"
         )
 
         if model_config is None:
             raise KeyError(
-                "The V3 checkpoint is missing model_config."
+                "The tied-codebook checkpoint is missing "
+                "model_config."
             )
 
         transformer = RespirationToEEGTransformer(
@@ -1405,6 +1715,7 @@ def main():
     comparison_saved = False
     window_accumulators = {}
     time_block_accumulators = {}
+    iterative_mask_counts = None
 
     if (
         MODEL_WINDOW_SEC
@@ -1505,11 +1816,40 @@ def main():
                     normalized_codebook
                 )
 
-            logits = transformer(
-                respiration,
-                masked_tokens,
-                **forward_kwargs,
+            (
+                predicted_tokens,
+                logits,
+                sample_mask_counts,
+            ) = generate_eeg_tokens(
+                transformer=transformer,
+                respiration=respiration,
+                initial_tokens=masked_tokens,
+                mask_token_id=mask_token_id,
+                iterative_steps=(
+                    args.iterative_steps
+                ),
+                forward_kwargs=forward_kwargs,
             )
+
+            if iterative_mask_counts is None:
+                iterative_mask_counts = (
+                    sample_mask_counts
+                )
+
+                if args.iterative_steps > 1:
+                    print(
+                        "Remaining masks after each pass:",
+                        iterative_mask_counts,
+                    )
+
+            elif (
+                iterative_mask_counts
+                != sample_mask_counts
+            ):
+                raise RuntimeError(
+                    "Iterative mask schedule changed between "
+                    "evaluation samples"
+                )
 
             targets_flat = true_tokens.flatten(
                 start_dim=1
@@ -1528,13 +1868,9 @@ def main():
 
             loss = position_losses.sum()
 
-            predicted_flat = logits.argmax(
-                dim=-1
-            )
-
-            predicted_tokens = (
-                predicted_flat.view_as(
-                    true_tokens
+            predicted_flat = (
+                predicted_tokens.flatten(
+                    start_dim=1
                 )
             )
 
@@ -2151,6 +2487,9 @@ def main():
                     shuffle_respiration=(
                         args.shuffle_respiration
                     ),
+                    iterative_steps=(
+                        args.iterative_steps
+                    ),
                 )
 
                 comparison_saved = True
@@ -2198,6 +2537,27 @@ def main():
             )
         ),
         "architecture": architecture,
+        "decoding_mode": (
+            "one_shot"
+            if args.iterative_steps == 1
+            else "iterative_confidence"
+        ),
+        "iterative_steps": (
+            args.iterative_steps
+        ),
+        "iterative_schedule": "cosine",
+        "iterative_deterministic_argmax": True,
+        "iterative_remaining_mask_counts": (
+            iterative_mask_counts
+        ),
+        "cross_entropy_definition": (
+            "fully masked one-shot logits"
+            if args.iterative_steps == 1
+            else (
+                "logits from the decoding pass where "
+                "each token was committed"
+            )
+        ),
         "model_config": (
             transformer_checkpoint.get(
                 "model_config"
@@ -2206,6 +2566,21 @@ def main():
         "semantic_loss_weight": (
             transformer_checkpoint.get(
                 "semantic_loss_weight"
+            )
+        ),
+        "alignment_loss_weight": (
+            transformer_checkpoint.get(
+                "alignment_loss_weight"
+            )
+        ),
+        "aligned_input_gate": (
+            transformer_checkpoint.get(
+                "aligned_input_gate"
+            )
+        ),
+        "aligned_output_gate": (
+            transformer_checkpoint.get(
+                "aligned_output_gate"
             )
         ),
         "temporal_loss_weight": (
@@ -2327,7 +2702,11 @@ def main():
         evaluated_samples,
     )
     print(
-        "Cross-entropy:",
+        (
+            "Cross-entropy:"
+            if args.iterative_steps == 1
+            else "Commit-step cross-entropy:"
+        ),
         f"{metrics['cross_entropy']:.4f}",
     )
     print(

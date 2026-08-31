@@ -31,6 +31,12 @@ class RespirationToEEGTransformer(nn.Module):
     projected directly into the frozen VQGAN latent space. The
     8192 logits are cosine similarities with the real codebook,
     rather than outputs of an unrelated classification layer.
+
+    When use_aligned_respiration_conditioning=True, respiration
+    segment t is injected directly into all eight EEG frequency
+    tokens at latent time t. This preserves the exact 64-to-64
+    temporal correspondence instead of relying only on global
+    self-attention to discover it.
     """
 
     def __init__(
@@ -51,6 +57,7 @@ class RespirationToEEGTransformer(nn.Module):
         codebook_dim=32,
         use_codebook_tied_output=False,
         codebook_temperature=0.07,
+        use_aligned_respiration_conditioning=False,
     ):
         super().__init__()
 
@@ -104,6 +111,18 @@ class RespirationToEEGTransformer(nn.Module):
                 "codebook_temperature must be positive"
             )
 
+        if (
+            use_aligned_respiration_conditioning
+            and num_respiration_tokens
+            != eeg_grid_width
+        ):
+            raise ValueError(
+                "Aligned respiration conditioning requires "
+                "num_respiration_tokens == eeg_grid_width, "
+                f"got {num_respiration_tokens} and "
+                f"{eeg_grid_width}"
+            )
+
         self.num_respiration_tokens = (
             num_respiration_tokens
         )
@@ -145,6 +164,9 @@ class RespirationToEEGTransformer(nn.Module):
         )
         self.codebook_temperature = (
             codebook_temperature
+        )
+        self.use_aligned_respiration_conditioning = (
+            use_aligned_respiration_conditioning
         )
         self.respiration_samples = (
             respiration_samples
@@ -206,6 +228,55 @@ class RespirationToEEGTransformer(nn.Module):
 
         else:
             self.window_embedding = None
+
+        if self.use_aligned_respiration_conditioning:
+            # This path receives respiration content before temporal
+            # or window embeddings are added. It therefore cannot
+            # solve the auxiliary task from absolute position alone.
+            self.aligned_respiration_projection = (
+                nn.Sequential(
+                    nn.LayerNorm(embedding_dim),
+                    nn.Linear(
+                        embedding_dim,
+                        embedding_dim,
+                    ),
+                    nn.GELU(),
+                    nn.Linear(
+                        embedding_dim,
+                        embedding_dim,
+                    ),
+                )
+            )
+
+            # Zero-initialized gates make a V3/V5 warm start
+            # functionally identical before V6 fine-tuning begins.
+            # The local auxiliary loss trains the aligned path while
+            # the final objective learns how far to open each gate.
+            self.aligned_input_gate = nn.Parameter(
+                torch.tensor(0.0)
+            )
+            self.aligned_output_gate = nn.Parameter(
+                torch.tensor(0.0)
+            )
+
+            # Auxiliary local prediction: each respiration segment
+            # predicts the eight codebook latents at the same time.
+            self.aligned_latent_projection = nn.Linear(
+                embedding_dim,
+                eeg_grid_height * codebook_dim,
+            )
+
+        else:
+            self.aligned_respiration_projection = None
+            self.aligned_latent_projection = None
+            self.register_parameter(
+                "aligned_input_gate",
+                None,
+            )
+            self.register_parameter(
+                "aligned_output_gate",
+                None,
+            )
 
         feedforward_dim = (
             embedding_dim * mlp_ratio
@@ -352,6 +423,9 @@ class RespirationToEEGTransformer(nn.Module):
             "codebook_temperature": (
                 self.codebook_temperature
             ),
+            "use_aligned_respiration_conditioning": (
+                self.use_aligned_respiration_conditioning
+            ),
         }
 
     def embed_window_index(
@@ -404,6 +478,7 @@ class RespirationToEEGTransformer(nn.Module):
     def embed_respiration(
         self,
         respiration,
+        return_content=False,
     ):
         """
         Convert 64 raw respiration segments into
@@ -427,16 +502,103 @@ class RespirationToEEGTransformer(nn.Module):
                 f"{respiration.shape[1]}"
             )
 
-        respiration_embeddings = (
+        respiration_content = (
             self.respiration_projection(
                 respiration
             )
         )
 
-        return (
-            respiration_embeddings
+        respiration_embeddings = (
+            respiration_content
             + self.respiration_position
         )
+
+        if return_content:
+            return (
+                respiration_embeddings,
+                respiration_content,
+            )
+
+        return respiration_embeddings
+
+    def create_aligned_respiration_context(
+        self,
+        respiration_content,
+    ):
+        """
+        Broadcast each of the 64 respiration representations to
+        the eight EEG frequency rows at the same latent time.
+
+        The flattened order remains frequency-major, matching
+        EEG token grids flattened from (B, 8, 64).
+        """
+
+        if not self.use_aligned_respiration_conditioning:
+            raise RuntimeError(
+                "Aligned respiration conditioning is disabled"
+            )
+
+        batch_size = respiration_content.shape[0]
+
+        aligned_context = (
+            self.aligned_respiration_projection(
+                respiration_content
+            )
+        )
+
+        return (
+            aligned_context
+            .unsqueeze(1)
+            .expand(
+                batch_size,
+                self.eeg_grid_height,
+                self.eeg_grid_width,
+                self.embedding_dim,
+            )
+            .reshape(
+                batch_size,
+                self.num_eeg_tokens,
+                self.embedding_dim,
+            )
+        )
+
+    def predict_aligned_respiration_latents(
+        self,
+        respiration_content,
+    ):
+        """
+        Predict the eight VQ latent vectors aligned with each
+        respiration segment, without positional embeddings.
+        """
+
+        if not self.use_aligned_respiration_conditioning:
+            raise RuntimeError(
+                "Aligned respiration conditioning is disabled"
+            )
+
+        batch_size = respiration_content.shape[0]
+
+        aligned_latents = (
+            self.aligned_latent_projection(
+                self.aligned_respiration_projection(
+                    respiration_content
+                )
+            )
+            .reshape(
+                batch_size,
+                self.eeg_grid_width,
+                self.eeg_grid_height,
+                self.codebook_dim,
+            )
+            .permute(0, 2, 1, 3)
+            .reshape(
+                batch_size,
+                self.num_eeg_tokens,
+                self.codebook_dim,
+            )
+        )
+
+        return aligned_latents
 
     def embed_eeg(
         self,
@@ -490,16 +652,48 @@ class RespirationToEEGTransformer(nn.Module):
         window_index=None,
         codebook=None,
         return_latents=False,
+        return_alignment_latents=False,
     ):
-        respiration_embeddings = (
+        if (
+            return_alignment_latents
+            and not self.use_aligned_respiration_conditioning
+        ):
+            raise ValueError(
+                "return_alignment_latents requires aligned "
+                "respiration conditioning"
+            )
+
+        (
+            respiration_embeddings,
+            respiration_content,
+        ) = (
             self.embed_respiration(
-                respiration
+                respiration,
+                return_content=True,
             )
         )
 
         eeg_embeddings = self.embed_eeg(
             masked_eeg_tokens
         )
+
+        aligned_context = None
+
+        if self.use_aligned_respiration_conditioning:
+            aligned_context = (
+                self.create_aligned_respiration_context(
+                    respiration_content
+                )
+            )
+
+            # Local conditioning before global attention.
+            eeg_embeddings = (
+                eeg_embeddings
+                + torch.tanh(
+                    self.aligned_input_gate
+                )
+                * aligned_context
+            )
 
         window_embeddings = self.embed_window_index(
             window_index=window_index,
@@ -545,6 +739,17 @@ class RespirationToEEGTransformer(nn.Module):
             :,
             self.num_respiration_tokens:,
         ]
+
+        if aligned_context is not None:
+            # A second residual path prevents deep global attention
+            # from washing out the time-aligned respiration signal.
+            eeg_features = (
+                eeg_features
+                + torch.tanh(
+                    self.aligned_output_gate
+                )
+                * aligned_context
+            )
 
         if self.use_codebook_tied_output:
             if codebook is None:
@@ -606,6 +811,19 @@ class RespirationToEEGTransformer(nn.Module):
                     codebook_unit.transpose(0, 1),
                 )
 
+            if return_alignment_latents:
+                aligned_latents = (
+                    self.predict_aligned_respiration_latents(
+                        respiration_content
+                    )
+                )
+
+                return (
+                    logits,
+                    predicted_latents,
+                    aligned_latents,
+                )
+
             if return_latents:
                 return logits, predicted_latents
 
@@ -619,6 +837,12 @@ class RespirationToEEGTransformer(nn.Module):
             raise ValueError(
                 "return_latents requires the "
                 "codebook-tied V3 output head"
+            )
+
+        if return_alignment_latents:
+            raise ValueError(
+                "return_alignment_latents requires the "
+                "codebook-tied output head"
             )
 
         return logits

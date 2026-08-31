@@ -38,7 +38,7 @@ DEFAULT_VQGAN_CHECKPOINT = Path(
 )
 
 DEFAULT_OUTPUT_DIR = Path(
-    "outputs/masked_transformer_codebook_v3"
+    "outputs/masked_transformer_time_aligned_v6"
 )
 
 MODEL_WINDOW_SEC = 256 * 60
@@ -145,9 +145,12 @@ def load_initial_transformer(
         "architecture"
     )
 
-    if architecture != (
-        "joint_codebook_tied_transformer_v3"
-    ):
+    supported_architectures = {
+        "joint_codebook_tied_transformer_v3",
+        "time_aligned_codebook_transformer_v6",
+    }
+
+    if architecture not in supported_architectures:
         raise ValueError(
             "Incompatible checkpoint architecture: "
             f"{architecture}"
@@ -157,10 +160,27 @@ def load_initial_transformer(
         "model_config"
     )
 
-    if checkpoint_model_config != model.get_config():
+    requested_config = model.get_config()
+
+    if architecture == "joint_codebook_tied_transformer_v3":
+        # V3/V5 checkpoints predate the explicit aligned path.
+        # Every shared parameter must still have the same config.
+        compatible_v3_config = dict(requested_config)
+        compatible_v3_config.pop(
+            "use_aligned_respiration_conditioning",
+            None,
+        )
+
+        if checkpoint_model_config != compatible_v3_config:
+            raise ValueError(
+                "Initial V3 checkpoint model_config does not "
+                "match the shared V6 configuration"
+            )
+
+    elif checkpoint_model_config != requested_config:
         raise ValueError(
-            "Initial checkpoint model_config does not "
-            "match the requested V3 model"
+            "Initial V6 checkpoint model_config does not "
+            "match the requested V6 model"
         )
 
     checkpoint_fold = checkpoint.get(
@@ -177,10 +197,43 @@ def load_initial_transformer(
             "match the requested held-out fold"
         )
 
-    model.load_state_dict(
-        get_model_state_dict(checkpoint),
-        strict=True,
-    )
+    if architecture == "joint_codebook_tied_transformer_v3":
+        incompatible = model.load_state_dict(
+            get_model_state_dict(checkpoint),
+            strict=False,
+        )
+
+        allowed_missing_prefixes = (
+            "aligned_respiration_projection.",
+            "aligned_input_gate",
+            "aligned_output_gate",
+            "aligned_latent_projection.",
+        )
+
+        unexpected_missing = [
+            key
+            for key in incompatible.missing_keys
+            if not key.startswith(
+                allowed_missing_prefixes
+            )
+        ]
+
+        if (
+            unexpected_missing
+            or incompatible.unexpected_keys
+        ):
+            raise ValueError(
+                "Unexpected V3-to-V6 state mismatch. "
+                f"Missing: {unexpected_missing}; "
+                "unexpected: "
+                f"{incompatible.unexpected_keys}"
+            )
+
+    else:
+        model.load_state_dict(
+            get_model_state_dict(checkpoint),
+            strict=True,
+        )
 
     return checkpoint
 
@@ -378,14 +431,16 @@ def window_indices_from_batch(
 def calculate_training_losses(
     logits,
     predicted_latents,
+    aligned_predicted_latents,
     target_tokens,
     mask,
     normalized_codebook,
     semantic_loss_weight,
     temporal_loss_weight,
     temporal_cosine_weight,
+    alignment_loss_weight,
 ):
-    """Calculate tied-codebook CE and direct latent losses."""
+    """Calculate token, semantic, temporal, and aligned losses."""
 
     batch_size = target_tokens.shape[0]
     grid_height = target_tokens.shape[1]
@@ -437,6 +492,41 @@ def calculate_training_losses(
     semantic_loss = (
         1.0 - semantic_cosine[mask_flat]
     ).mean()
+
+    if aligned_predicted_latents is not None:
+        if (
+            aligned_predicted_latents.shape
+            != predicted_latents.shape
+        ):
+            raise ValueError(
+                "Aligned latent shape does not match final "
+                "predicted latent shape: "
+                f"{tuple(aligned_predicted_latents.shape)} "
+                f"vs {tuple(predicted_latents.shape)}"
+            )
+
+        aligned_unit = F.normalize(
+            aligned_predicted_latents.float(),
+            p=2,
+            dim=-1,
+            eps=1e-6,
+        )
+
+        aligned_cosine = (
+            aligned_unit * target_unit
+        ).sum(dim=-1)
+
+        # This auxiliary head never receives EEG tokens, so every
+        # aligned position can be supervised even during partial
+        # masking. In the recommended V6 run all positions are masked.
+        alignment_loss = (
+            1.0 - aligned_cosine
+        ).mean()
+
+    else:
+        alignment_loss = (
+            predicted_latents_float.sum() * 0.0
+        )
 
     latent_dim = predicted_unit.shape[-1]
 
@@ -511,12 +601,14 @@ def calculate_training_losses(
         cross_entropy_loss
         + semantic_loss_weight * semantic_loss
         + temporal_loss_weight * temporal_loss
+        + alignment_loss_weight * alignment_loss
     )
 
     return {
         "total": total_loss,
         "cross_entropy": cross_entropy_loss,
         "semantic": semantic_loss,
+        "alignment": alignment_loss,
         "temporal": temporal_loss,
         "temporal_smooth_l1": (
             temporal_smooth_l1
@@ -619,6 +711,7 @@ def run_epoch(
     semantic_loss_weight=0.5,
     temporal_loss_weight=1.0,
     temporal_cosine_weight=0.25,
+    alignment_loss_weight=0.5,
     optimizer=None,
     scaler=None,
     gradient_accumulation_steps=1,
@@ -661,6 +754,7 @@ def run_epoch(
     total_loss = 0.0
     total_cross_entropy_loss = 0.0
     total_semantic_loss = 0.0
+    total_alignment_loss = 0.0
     total_temporal_loss = 0.0
     total_temporal_smooth_l1 = 0.0
     total_temporal_cosine_loss = 0.0
@@ -759,21 +853,40 @@ def run_epoch(
                 dtype=torch.float16,
                 enabled=(device.type == "cuda"),
             ):
-                (
-                    logits,
-                    predicted_latents,
-                ) = model(
+                model_outputs = model(
                     respiration,
                     masked_tokens,
                     window_index=window_indices,
                     codebook=normalized_codebook,
                     return_latents=True,
+                    return_alignment_latents=(
+                        model.use_aligned_respiration_conditioning
+                    ),
                 )
+
+                if (
+                    model.use_aligned_respiration_conditioning
+                ):
+                    (
+                        logits,
+                        predicted_latents,
+                        aligned_predicted_latents,
+                    ) = model_outputs
+
+                else:
+                    (
+                        logits,
+                        predicted_latents,
+                    ) = model_outputs
+                    aligned_predicted_latents = None
 
             losses = calculate_training_losses(
                 logits=logits,
                 predicted_latents=(
                     predicted_latents
+                ),
+                aligned_predicted_latents=(
+                    aligned_predicted_latents
                 ),
                 target_tokens=eeg_tokens,
                 mask=mask,
@@ -788,6 +901,9 @@ def run_epoch(
                 ),
                 temporal_cosine_weight=(
                     temporal_cosine_weight
+                ),
+                alignment_loss_weight=(
+                    alignment_loss_weight
                 ),
             )
 
@@ -903,6 +1019,11 @@ def run_epoch(
                 * number_of_positions
             )
 
+            total_alignment_loss += (
+                losses["alignment"].item()
+                * number_of_positions
+            )
+
             total_temporal_loss += (
                 losses["temporal"].item()
                 * number_of_positions
@@ -962,6 +1083,8 @@ def run_epoch(
                 f"{total_cross_entropy_loss / total_positions:.4f}"
                 " | semantic="
                 f"{total_semantic_loss / total_positions:.4f}"
+                " | alignment="
+                f"{total_alignment_loss / total_positions:.4f}"
                 " | temporal="
                 f"{total_temporal_loss / total_positions:.4f}"
                 " | temp_l1="
@@ -997,6 +1120,10 @@ def run_epoch(
         ),
         "semantic_loss": (
             total_semantic_loss
+            / total_positions
+        ),
+        "alignment_loss": (
+            total_alignment_loss
             / total_positions
         ),
         "temporal_loss": (
@@ -1130,6 +1257,16 @@ def main():
     )
 
     parser.add_argument(
+        "--aligned-lr-multiplier",
+        type=float,
+        default=4.0,
+        help=(
+            "Learning-rate multiplier for the new V6 aligned "
+            "conditioning modules and gates."
+        ),
+    )
+
+    parser.add_argument(
         "--weight-decay",
         type=float,
         default=0.05,
@@ -1155,6 +1292,17 @@ def main():
         "--semantic-loss-weight",
         type=float,
         default=0.50,
+    )
+
+    parser.add_argument(
+        "--alignment-loss-weight",
+        type=float,
+        default=0.50,
+        help=(
+            "Weight of the respiration-only local latent "
+            "prediction loss. This directly supervises the "
+            "64 aligned four-minute positions."
+        ),
     )
 
     parser.add_argument(
@@ -1258,6 +1406,16 @@ def main():
             "max-grad-norm must be positive"
         )
 
+    if args.lr <= 0:
+        raise ValueError(
+            "lr must be positive"
+        )
+
+    if args.aligned_lr_multiplier <= 0:
+        raise ValueError(
+            "aligned-lr-multiplier must be positive"
+        )
+
     if not (
         0.0
         <= args.full_mask_probability
@@ -1271,6 +1429,11 @@ def main():
     if args.semantic_loss_weight < 0:
         raise ValueError(
             "semantic-loss-weight cannot be negative"
+        )
+
+    if args.alignment_loss_weight < 0:
+        raise ValueError(
+            "alignment-loss-weight cannot be negative"
         )
 
     if args.temporal_loss_weight < 0:
@@ -1481,6 +1644,7 @@ def main():
         codebook_temperature=(
             args.codebook_temperature
         ),
+        use_aligned_respiration_conditioning=True,
     ).to(device)
 
     normalized_codebook = F.normalize(
@@ -1501,9 +1665,37 @@ def main():
         )
     )
 
+    base_parameters = []
+    aligned_parameters = []
+
+    for parameter_name, parameter in (
+        model.named_parameters()
+    ):
+        if parameter_name.startswith("aligned_"):
+            aligned_parameters.append(parameter)
+
+        else:
+            base_parameters.append(parameter)
+
+    if not aligned_parameters:
+        raise RuntimeError(
+            "No V6 aligned parameters were found"
+        )
+
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
+        [
+            {
+                "params": base_parameters,
+                "lr": args.lr,
+            },
+            {
+                "params": aligned_parameters,
+                "lr": (
+                    args.lr
+                    * args.aligned_lr_multiplier
+                ),
+            },
+        ],
         weight_decay=args.weight_decay,
     )
 
@@ -1531,7 +1723,7 @@ def main():
 
     print("Device:", device)
     print(
-        "Model: codebook-tied latent Transformer V3"
+        "Model: time-aligned codebook Transformer V6"
     )
     print("Training folds:", train_folds)
     print(
@@ -1589,6 +1781,8 @@ def main():
     print(
         "Loss weights: CE=1.0 | latent semantic=",
         args.semantic_loss_weight,
+        "| aligned respiration=",
+        args.alignment_loss_weight,
         "| temporal=",
         args.temporal_loss_weight,
     )
@@ -1601,8 +1795,12 @@ def main():
         args.codebook_temperature,
     )
     print(
-        "Learning rate:",
+        "Base learning rate:",
         args.lr,
+    )
+    print(
+        "Aligned learning rate:",
+        args.lr * args.aligned_lr_multiplier,
     )
     print(
         "VQGAN trainable parameters:",
@@ -1628,6 +1826,9 @@ def main():
         learning_rate = optimizer.param_groups[
             0
         ]["lr"]
+        aligned_learning_rate = optimizer.param_groups[
+            1
+        ]["lr"]
 
         train_metrics = run_epoch(
             model=model,
@@ -1645,6 +1846,9 @@ def main():
             ),
             temporal_cosine_weight=(
                 args.temporal_cosine_weight
+            ),
+            alignment_loss_weight=(
+                args.alignment_loss_weight
             ),
             optimizer=optimizer,
             scaler=scaler,
@@ -1678,6 +1882,9 @@ def main():
             temporal_cosine_weight=(
                 args.temporal_cosine_weight
             ),
+            alignment_loss_weight=(
+                args.alignment_loss_weight
+            ),
             max_batches=(
                 args.max_val_batches
             ),
@@ -1686,15 +1893,29 @@ def main():
 
         epoch_number = epoch_index + 1
 
+        aligned_input_gate = float(
+            torch.tanh(
+                model.aligned_input_gate.detach()
+            ).item()
+        )
+        aligned_output_gate = float(
+            torch.tanh(
+                model.aligned_output_gate.detach()
+            ).item()
+        )
+
         print(
             f"Epoch {epoch_number:03d}"
             f" | lr={learning_rate:.2e}"
+            f" | aligned_lr={aligned_learning_rate:.2e}"
             f" | train_loss="
             f"{train_metrics['loss']:.4f}"
             f" | train_ce="
             f"{train_metrics['cross_entropy_loss']:.4f}"
             f" | train_sem="
             f"{train_metrics['semantic_loss']:.4f}"
+            f" | train_align="
+            f"{train_metrics['alignment_loss']:.4f}"
             f" | train_temp="
             f"{train_metrics['temporal_loss']:.4f}"
             f" | train_temp_l1="
@@ -1717,6 +1938,8 @@ def main():
             f"{validation_metrics['cross_entropy_loss']:.4f}"
             f" | val_sem="
             f"{validation_metrics['semantic_loss']:.4f}"
+            f" | val_align="
+            f"{validation_metrics['alignment_loss']:.4f}"
             f" | val_temp="
             f"{validation_metrics['temporal_loss']:.4f}"
             f" | val_temp_l1="
@@ -1728,14 +1951,16 @@ def main():
             f" | val_codes="
             f"{validation_metrics['unique_predicted_codes']}"
             f" | val_top5="
-            f"{validation_metrics['top5_accuracy']:.4f}",
+            f"{validation_metrics['top5_accuracy']:.4f}"
+            f" | gate_in={aligned_input_gate:.4f}"
+            f" | gate_out={aligned_output_gate:.4f}",
             flush=True,
         )
 
         checkpoint = {
-            "version": 5,
+            "version": 6,
             "architecture": (
-                "joint_codebook_tied_transformer_v3"
+                "time_aligned_codebook_transformer_v6"
             ),
             "model_config": model.get_config(),
             "epoch": epoch_number,
@@ -1746,6 +1971,12 @@ def main():
             "min_db": min_db,
             "max_db": max_db,
             "learning_rate": learning_rate,
+            "aligned_learning_rate": (
+                aligned_learning_rate
+            ),
+            "aligned_lr_multiplier": (
+                args.aligned_lr_multiplier
+            ),
             "weight_decay": (
                 args.weight_decay
             ),
@@ -1757,6 +1988,9 @@ def main():
             ),
             "semantic_loss_weight": (
                 args.semantic_loss_weight
+            ),
+            "alignment_loss_weight": (
+                args.alignment_loss_weight
             ),
             "temporal_loss_weight": (
                 args.temporal_loss_weight
@@ -1802,6 +2036,12 @@ def main():
             ),
             "validation_metrics": (
                 validation_metrics
+            ),
+            "aligned_input_gate": (
+                aligned_input_gate
+            ),
+            "aligned_output_gate": (
+                aligned_output_gate
             ),
         }
 
