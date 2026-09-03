@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import numpy as np
@@ -5,6 +6,7 @@ import torch
 from torch.utils.data import Dataset
 
 from src.data.preprocessing import (
+    MODEL_WINDOW_SEC,
     normalize_db_spectrogram,
 )
 
@@ -15,7 +17,9 @@ class PhysiologyPairDataset(Dataset):
 
     It supports:
     - legacy spectrograms already normalized to [0, 1];
-    - new SHHS spectrograms saved in dB.
+    - new SHHS spectrograms saved in dB;
+    - external datasets such as MESA where start_sec can be
+      inferred from the window index in the filename.
 
     SHHS window metadata is returned when available so that
     evaluation can be grouped by recording and temporal offset.
@@ -73,6 +77,10 @@ class PhysiologyPairDataset(Dataset):
                 "respiration"
             ].astype(np.float32)
 
+            # --------------------------------------------------
+            # EEG spectrogram
+            # --------------------------------------------------
+
             if "eeg_spectrogram_db" in sample:
                 if (
                     self.min_db is None
@@ -113,6 +121,10 @@ class PhysiologyPairDataset(Dataset):
                     f"Available keys: {sample.files}"
                 )
 
+            # --------------------------------------------------
+            # Optional metadata
+            # --------------------------------------------------
+
             freqs = None
 
             if "freqs" in sample:
@@ -134,9 +146,15 @@ class PhysiologyPairDataset(Dataset):
                     sample["fold"]
                 )
 
+            # --------------------------------------------------
+            # Window start time
+            # --------------------------------------------------
+
             start_sec = None
 
             if "start_sec" in sample:
+                # Standard SHHS case:
+                # metadata explicitly stored in NPZ
                 start_sec = float(
                     sample["start_sec"]
                 )
@@ -154,6 +172,32 @@ class PhysiologyPairDataset(Dataset):
                 visit = str(
                     sample["visit"]
                 )
+
+        # ------------------------------------------------------
+        # External dataset fallback (e.g. MESA)
+        #
+        # mesa-sleep-3785-window000.npz -> 0 s
+        # mesa-sleep-3785-window001.npz -> 15360 s
+        # ------------------------------------------------------
+
+        if start_sec is None:
+            match = re.search(
+                r"-window(\d+)\.npz$",
+                file_path.name,
+            )
+
+            if match is not None:
+                window_idx = int(
+                    match.group(1)
+                )
+
+                start_sec = float(
+                    window_idx * MODEL_WINDOW_SEC
+                )
+
+        # ------------------------------------------------------
+        # Validation
+        # ------------------------------------------------------
 
         if respiration.ndim != 2:
             raise ValueError(
@@ -177,6 +221,10 @@ class PhysiologyPairDataset(Dataset):
             raise ValueError(
                 f"Non-finite EEG in {file_path}"
             )
+
+        # ------------------------------------------------------
+        # Output
+        # ------------------------------------------------------
 
         output = {
             "respiration": torch.from_numpy(

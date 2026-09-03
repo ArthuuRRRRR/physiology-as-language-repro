@@ -32,10 +32,26 @@ def preprocess_edf(edf_path, output_dir):
     )
 
     saved = 0
+    skipped = 0
 
     for window_idx in range(n_windows):
 
         start_sec = window_idx * MODEL_WINDOW_SEC
+
+        output_path = (
+            output_dir
+            / f"{subject_id}-window{window_idx:03d}.npz"
+        )
+
+        # Resume mode:
+        # skip already preprocessed windows
+        if output_path.exists():
+            print(
+                f"  skip {output_path.name} "
+                f"(already exists)"
+            )
+            skipped += 1
+            continue
 
         respiration, eeg_spectrogram, freqs = preprocess_pair(
             respiration=data["respiration"],
@@ -43,11 +59,6 @@ def preprocess_edf(edf_path, output_dir):
             fs_resp=data["fs_resp"],
             fs_eeg=data["fs_eeg"],
             start_sec=start_sec,
-        )
-
-        output_path = (
-            output_dir
-            / f"{subject_id}-window{window_idx:03d}.npz"
         )
 
         np.savez_compressed(
@@ -65,7 +76,7 @@ def preprocess_edf(edf_path, output_dir):
 
         saved += 1
 
-    return saved
+    return saved, skipped
 
 
 def main():
@@ -90,6 +101,16 @@ def main():
         help="Limit number of EDF files for development/testing.",
     )
 
+    parser.add_argument(
+        "--start-subject",
+        type=str,
+        default=None,
+        help=(
+            "Resume preprocessing from this MESA subject ID. "
+            "Example: --start-subject 6672"
+        ),
+    )
+
     args = parser.parse_args()
 
     args.output_dir.mkdir(
@@ -101,19 +122,34 @@ def main():
         args.mesa_root.glob("*.edf")
     )
 
+    # Resume directly from a chosen subject
+    if args.start_subject is not None:
+        start_name = (
+            f"mesa-sleep-{args.start_subject}.edf"
+        )
+
+        edf_files = [
+            p for p in edf_files
+            if p.name >= start_name
+        ]
+
     if args.max_files is not None:
         edf_files = edf_files[: args.max_files]
 
-    print("EDF files:", len(edf_files))
+    print("EDF files to process:", len(edf_files))
 
-    total_samples = 0
+    total_saved = 0
+    total_skipped = 0
 
     for edf_path in edf_files:
         try:
-            total_samples += preprocess_edf(
+            saved, skipped = preprocess_edf(
                 edf_path,
                 args.output_dir,
             )
+
+            total_saved += saved
+            total_skipped += skipped
 
         except Exception as exc:
             print(
@@ -122,7 +158,12 @@ def main():
 
     print()
     print("Finished.")
-    print("Total samples:", total_samples)
+    print("New samples saved:", total_saved)
+    print("Existing samples skipped:", total_skipped)
+    print(
+        "Total considered:",
+        total_saved + total_skipped,
+    )
 
 
 if __name__ == "__main__":

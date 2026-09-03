@@ -4,21 +4,38 @@ import numpy as np
 import pyedflib
 
 
-DEFAULT_RESP_CHANNEL = "Thor"
+DEFAULT_RESP_CHANNEL = "Abdo"
 DEFAULT_EEG_CHANNEL = "EEG3"
 
 
 def _find_channel(labels, channel_name):
-    """
-    Return the index of a channel from its EDF label.
-    """
-    if channel_name not in labels:
+    normalized = [label.strip().lower() for label in labels]
+    target = channel_name.strip().lower()
+
+    if target not in normalized:
         raise ValueError(
             f"Channel '{channel_name}' not found.\n"
             f"Available channels: {labels}"
         )
 
-    return labels.index(channel_name)
+    return normalized.index(target)
+
+
+def _eeg_to_volts(signal, unit):
+    unit = unit.strip().lower()
+
+    if unit in {"uv", "µv", "μv"}:
+        return signal * 1e-6
+
+    if unit == "mv":
+        return signal * 1e-3
+
+    if unit == "v":
+        return signal
+
+    raise ValueError(
+        f"Unsupported EEG physical unit: '{unit}'"
+    )
 
 
 def load_mesa_pair(
@@ -26,62 +43,68 @@ def load_mesa_pair(
     resp_channel=DEFAULT_RESP_CHANNEL,
     eeg_channel=DEFAULT_EEG_CHANNEL,
 ):
-    """
-    Load synchronized respiration and EEG signals from one MESA EDF file.
-
-    Parameters
-    ----------
-    edf_path : str or Path
-        Path to the MESA EDF file.
-
-    resp_channel : str
-        Respiration channel name.
-        Default: Thor.
-
-    eeg_channel : str
-        EEG channel name.
-        Default: EEG3 (C4-M1 in MESA).
-
-    Returns
-    -------
-    dict
-        Dictionary containing:
-        - respiration
-        - eeg
-        - fs_resp
-        - fs_eeg
-        - resp_label
-        - eeg_label
-        - duration_sec
-    """
-
     edf_path = Path(edf_path)
 
     if not edf_path.exists():
-        raise FileNotFoundError(f"EDF file not found: {edf_path}")
+        raise FileNotFoundError(
+            f"EDF file not found: {edf_path}"
+        )
 
     edf = pyedflib.EdfReader(str(edf_path))
 
     try:
         labels = edf.getSignalLabels()
 
-        resp_idx = _find_channel(labels, resp_channel)
-        eeg_idx = _find_channel(labels, eeg_channel)
+        resp_idx = _find_channel(
+            labels,
+            resp_channel,
+        )
 
-        respiration = edf.readSignal(resp_idx).astype(np.float32)
-        eeg = edf.readSignal(eeg_idx).astype(np.float32)
+        eeg_idx = _find_channel(
+            labels,
+            eeg_channel,
+        )
 
-        fs_resp = float(edf.getSampleFrequency(resp_idx))
-        fs_eeg = float(edf.getSampleFrequency(eeg_idx))
+        respiration = edf.readSignal(
+            resp_idx
+        ).astype(np.float32)
 
-        resp_duration = len(respiration) / fs_resp
-        eeg_duration = len(eeg) / fs_eeg
+        eeg = edf.readSignal(
+            eeg_idx
+        ).astype(np.float32)
 
-        # Check that both signals cover the same recording duration
-        if abs(resp_duration - eeg_duration) > 1.0:
+        fs_resp = float(
+            edf.getSampleFrequency(resp_idx)
+        )
+
+        fs_eeg = float(
+            edf.getSampleFrequency(eeg_idx)
+        )
+
+        eeg_unit = edf.getPhysicalDimension(
+            eeg_idx
+        )
+
+        eeg = _eeg_to_volts(
+            eeg,
+            eeg_unit,
+        ).astype(np.float32)
+
+        resp_duration = (
+            len(respiration) / fs_resp
+        )
+
+        eeg_duration = (
+            len(eeg) / fs_eeg
+        )
+
+        if abs(
+            resp_duration - eeg_duration
+        ) > 1.0:
             raise ValueError(
                 "Respiration and EEG durations do not match: "
-                f"{resp_duration:.2f}s vs {eeg_duration:.2f}s"
+                f"{resp_duration:.2f}s vs "
+                f"{eeg_duration:.2f}s"
             )
 
         return {
@@ -91,7 +114,11 @@ def load_mesa_pair(
             "fs_eeg": fs_eeg,
             "resp_label": labels[resp_idx],
             "eeg_label": labels[eeg_idx],
-            "duration_sec": min(resp_duration, eeg_duration),
+            "eeg_unit_original": eeg_unit,
+            "duration_sec": min(
+                resp_duration,
+                eeg_duration,
+            ),
         }
 
     finally:
