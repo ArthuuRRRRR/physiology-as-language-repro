@@ -1,4 +1,4 @@
-"""Complete paper-oriented respiration-to-EEG masked Transformer."""
+"""Paper-oriented masked respiration-to-EEG Transformer."""
 
 from __future__ import annotations
 
@@ -11,18 +11,11 @@ from .paper_encoder import PaperRespirationEEGEncoder
 
 
 class PaperMaskedRespirationToEEGTransformer(nn.Module):
-    """8-block encoder + 8-block decoder from Physiology as Language.
+    """MAGE-style joint respiration/EEG Transformer.
 
-    Inputs
-    ------
-    respiration:
-        Float tensor shaped ``(B, 64, 2400)`` for the current SHHS 10-Hz
-        preprocessing.
-    eeg_tokens:
-        Ground-truth VQ token IDs shaped ``(B, 8, 64)`` or ``(B, 512)``.
-
-    The forward pass performs MAGE-style masking internally and returns the
-    masked-token cross-entropy required by the paper.
+    The default configuration is the paper reproduction. Experimental flags
+    are explicit and default to False so baseline checkpoints remain
+    compatible.
     """
 
     def __init__(
@@ -44,12 +37,30 @@ class PaperMaskedRespirationToEEGTransformer(nn.Module):
         mask_ratio_mu: float = 0.55,
         mask_ratio_std: float = 0.25,
         label_smoothing: float = 0.0,
+        shared_temporal_position: bool = False,
+        temporal_alignment_tag: bool = False,
+        temporal_attention_mask: bool = False,
     ) -> None:
         super().__init__()
 
-        self.num_eeg_tokens = eeg_grid_height * eeg_grid_width
+        if (
+            shared_temporal_position
+            and temporal_alignment_tag
+        ):
+            raise ValueError(
+                "shared_temporal_position and temporal_alignment_tag are "
+                "separate ablations and cannot be enabled together"
+            )
+
+        self.num_eeg_tokens = (
+            eeg_grid_height
+            * eeg_grid_width
+        )
         self.codebook_size = codebook_size
-        self.label_smoothing = label_smoothing
+        self.label_smoothing = (
+            label_smoothing
+        )
+
         self.model_config = {
             "respiration_samples": respiration_samples,
             "num_respiration_tokens": num_respiration_tokens,
@@ -68,6 +79,9 @@ class PaperMaskedRespirationToEEGTransformer(nn.Module):
             "mask_ratio_mu": mask_ratio_mu,
             "mask_ratio_std": mask_ratio_std,
             "label_smoothing": label_smoothing,
+            "shared_temporal_position": shared_temporal_position,
+            "temporal_alignment_tag": temporal_alignment_tag,
+            "temporal_attention_mask": temporal_attention_mask,
         }
 
         self.encoder = PaperRespirationEEGEncoder(
@@ -86,6 +100,15 @@ class PaperMaskedRespirationToEEGTransformer(nn.Module):
             mask_ratio_max=mask_ratio_max,
             mask_ratio_mu=mask_ratio_mu,
             mask_ratio_std=mask_ratio_std,
+            shared_temporal_position=(
+                shared_temporal_position
+            ),
+            temporal_alignment_tag=(
+                temporal_alignment_tag
+            ),
+            temporal_attention_mask=(
+                temporal_attention_mask
+            ),
         )
         self.decoder = PaperEEGTokenDecoder(
             num_respiration_tokens=num_respiration_tokens,
@@ -98,13 +121,22 @@ class PaperMaskedRespirationToEEGTransformer(nn.Module):
             mlp_ratio=mlp_ratio,
             dropout=dropout,
             layer_norm_eps=layer_norm_eps,
+            shared_temporal_position=(
+                shared_temporal_position
+            ),
+            temporal_alignment_tag=(
+                temporal_alignment_tag
+            ),
+            temporal_attention_mask=(
+                temporal_attention_mask
+            ),
         )
 
     @property
     def mask_token_id(self) -> int:
         return self.encoder.mask_token_id
 
-    def get_config(self) -> dict[str, int | float]:
+    def get_config(self) -> dict[str, int | float | bool]:
         return dict(self.model_config)
 
     def masked_token_loss(
@@ -114,14 +146,24 @@ class PaperMaskedRespirationToEEGTransformer(nn.Module):
         all_mask: Tensor,
     ) -> Tensor:
         per_token_loss = F.cross_entropy(
-            logits.reshape(-1, self.codebook_size),
+            logits.reshape(
+                -1,
+                self.codebook_size,
+            ),
             targets.reshape(-1),
             reduction="none",
-            label_smoothing=self.label_smoothing,
+            label_smoothing=(
+                self.label_smoothing
+            ),
         ).reshape_as(targets)
 
-        denominator = all_mask.sum().clamp_min(1)
-        return (per_token_loss * all_mask).sum() / denominator
+        denominator = (
+            all_mask.sum().clamp_min(1)
+        )
+        return (
+            per_token_loss
+            * all_mask
+        ).sum() / denominator
 
     def forward(
         self,
@@ -145,7 +187,11 @@ class PaperMaskedRespirationToEEGTransformer(nn.Module):
             encoded=encoded,
             drop_mask=drop_mask,
             all_mask=all_mask,
-            token_embedding_weight=self.encoder.eeg_token_embedding.weight,
+            token_embedding_weight=(
+                self.encoder
+                .eeg_token_embedding
+                .weight
+            ),
         )
         loss = self.masked_token_loss(
             logits=logits,
@@ -163,7 +209,10 @@ class PaperMaskedRespirationToEEGTransformer(nn.Module):
         }
 
     @torch.no_grad()
-    def predict_from_respiration(self, respiration: Tensor) -> Tensor:
+    def predict_from_respiration(
+        self,
+        respiration: Tensor,
+    ) -> Tensor:
         """Predict all 512 EEG-token logits from respiration alone."""
         dummy_eeg_tokens = torch.zeros(
             respiration.shape[0],
