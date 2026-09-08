@@ -1469,6 +1469,43 @@ def main():
         default=2,
     )
 
+    comparison_group = (
+        parser.add_mutually_exclusive_group()
+    )
+
+    comparison_group.add_argument(
+        "--comparison-index",
+        type=int,
+        default=None,
+        help=(
+            "Zero-based evaluation index used for the saved "
+            "qualitative comparison. If neither comparison "
+            "selector is provided, index 100 is used to "
+            "preserve the current evaluator behaviour."
+        ),
+    )
+
+    comparison_group.add_argument(
+        "--comparison-subject-id",
+        type=str,
+        default=None,
+        help=(
+            "Subject ID whose reconstruction should be saved "
+            "for the qualitative comparison."
+        ),
+    )
+
+    parser.add_argument(
+        "--comparison-window-index",
+        type=int,
+        default=None,
+        help=(
+            "Optional window index used together with "
+            "--comparison-subject-id. If omitted, the first "
+            "available window for that subject is selected."
+        ),
+    )
+
     respiration_group = (
         parser
         .add_mutually_exclusive_group()
@@ -1485,6 +1522,37 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if (
+        args.comparison_index is None
+        and args.comparison_subject_id is None
+    ):
+        args.comparison_index = 100
+
+    if (
+        args.comparison_index is not None
+        and args.comparison_index < 0
+    ):
+        raise ValueError(
+            "--comparison-index must be >= 0."
+        )
+
+    if (
+        args.comparison_window_index is not None
+        and args.comparison_window_index < 0
+    ):
+        raise ValueError(
+            "--comparison-window-index must be >= 0."
+        )
+
+    if (
+        args.comparison_window_index is not None
+        and args.comparison_subject_id is None
+    ):
+        raise ValueError(
+            "--comparison-window-index requires "
+            "--comparison-subject-id."
+        )
 
     if (
         args.max_samples
@@ -1712,6 +1780,25 @@ def main():
         args.shuffle_respiration
     )
 
+    if args.comparison_subject_id is not None:
+        print(
+            "Qualitative comparison selector:",
+            "subject_id=",
+            args.comparison_subject_id,
+            "window_index=",
+            (
+                "first available"
+                if args.comparison_window_index is None
+                else args.comparison_window_index
+            ),
+        )
+    else:
+        print(
+            "Qualitative comparison selector:",
+            "evaluation_index=",
+            args.comparison_index,
+        )
+
     loader = DataLoader(
         dataset,
         batch_size=1,
@@ -1749,6 +1836,7 @@ def main():
     )
 
     comparison_saved = False
+    comparison_metadata = None
     evaluated_samples = 0
 
     # --------------------------------------------------------
@@ -2126,7 +2214,39 @@ def main():
             # Visual comparison
             # ------------------------------------------------
 
-            if not comparison_saved and evaluated_samples == 100:
+            batch_dataset = str(
+                batch["dataset"][0]
+            )
+
+            batch_subject_id = str(
+                batch["subject_id"][0]
+            )
+
+            if args.comparison_subject_id is not None:
+                comparison_match = (
+                    batch_subject_id
+                    == args.comparison_subject_id
+                )
+
+                if (
+                    comparison_match
+                    and args.comparison_window_index
+                    is not None
+                ):
+                    comparison_match = (
+                        window_index
+                        == args.comparison_window_index
+                    )
+            else:
+                comparison_match = (
+                    evaluated_samples
+                    == args.comparison_index
+                )
+
+            if (
+                not comparison_saved
+                and comparison_match
+            ):
 
                 def to_numpy(x):
                     if torch.is_tensor(x):
@@ -2140,9 +2260,67 @@ def main():
                     prediction=to_numpy(predicted_reconstruction),
                 )
 
+                comparison_metadata = {
+                    "evaluation_index": int(
+                        evaluated_samples
+                    ),
+                    "dataset": batch_dataset,
+                    "subject_id": batch_subject_id,
+                    "window_index": int(
+                        window_index
+                    ),
+                    "start_sec": int(
+                        start_sec
+                    ),
+                    "start_min": float(
+                        start_sec / 60.0
+                    ),
+                }
+
+                if (
+                    args.shuffle_respiration
+                    and "respiration_source_subject"
+                    in batch
+                ):
+                    comparison_metadata[
+                        "respiration_source_subject"
+                    ] = str(
+                        batch[
+                            "respiration_source_subject"
+                        ][0]
+                    )
+
+                comparison_metadata_path = (
+                    output_dir
+                    / "reconstruction_metadata.json"
+                )
+
+                with comparison_metadata_path.open(
+                    "w",
+                    encoding="utf-8",
+                ) as file:
+                    json.dump(
+                        comparison_metadata,
+                        file,
+                        indent=2,
+                    )
+
                 print(
                     "Reconstruction arrays saved:",
                     output_dir / "reconstruction_arrays.npz",
+                )
+
+                print(
+                    "Qualitative example:",
+                    f"eval_index={evaluated_samples}",
+                    f"dataset={batch_dataset}",
+                    f"subject_id={batch_subject_id}",
+                    f"window_index={window_index}",
+                )
+
+                print(
+                    "Reconstruction metadata saved:",
+                    comparison_metadata_path,
                 )
 
                 save_comparison(
@@ -2258,6 +2436,26 @@ def main():
 
         "shuffle_respiration": (
             args.shuffle_respiration
+        ),
+
+        "comparison_selector": {
+            "comparison_index": (
+                args.comparison_index
+            ),
+            "comparison_subject_id": (
+                args.comparison_subject_id
+            ),
+            "comparison_window_index": (
+                args.comparison_window_index
+            ),
+        },
+
+        "comparison_saved": (
+            comparison_saved
+        ),
+
+        "comparison_example": (
+            comparison_metadata
         ),
 
         **{
@@ -2451,11 +2649,31 @@ def main():
 
     print()
 
-    print(
-        "Comparison saved:",
-        output_dir
-        / "reconstruction_comparison.png"
-    )
+    if comparison_saved:
+        print(
+            "Comparison saved:",
+            output_dir
+            / "reconstruction_comparison.png"
+        )
+
+        print(
+            "Reconstruction arrays saved:",
+            output_dir
+            / "reconstruction_arrays.npz"
+        )
+
+        print(
+            "Reconstruction metadata saved:",
+            output_dir
+            / "reconstruction_metadata.json"
+        )
+
+    else:
+        print(
+            "Comparison saved: NO - requested "
+            "qualitative example was not found "
+            "within the evaluated samples."
+        )
 
     print(
         "Metrics saved:",
