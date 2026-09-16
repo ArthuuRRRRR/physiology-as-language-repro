@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import pickle
 import re
 import sys
@@ -46,19 +47,32 @@ EEG_FLAT_STD_THRESHOLD = 1e-4
 # Dataset-specific corrections
 # ============================================================
 
-# Two KVSS recordings have amplitudes several orders of
-# magnitude larger than the rest of the cohort.
-KVSS_EXCLUDED_SUBJECTS = {
-    "B2019-EM-01-0125",
-    "B2019-EM-01-0163",
+# Recordings identified as clear channel/amplitude failures.
+# Exclusions are applied BOTH when computing dataset statistics
+# and when generating VQGAN spectrogram windows.
+EXCLUDED_SUBJECTS = {
+    "kvss": {
+        "B2019-EM-01-0125",
+        "B2019-EM-01-0163",
+    },
+    "shhs2": {
+        "shhs2-204890",
+    },
+    "shhs1": {
+        "shhs1-202345",
+        "shhs1-204822",
+    },
+    "kiss": {
+        "A2016-EM-01-0071",
+    },
 }
 
 
 # MrOS2 contains two clear amplitude populations.
 # Subjects below this raw standard deviation are rescaled
-# by x1000 before normalization and PSD computation.
+# by x250 before normalization and PSD computation.
 MROS2_LOW_SCALE_STD_THRESHOLD = 1e-5
-MROS2_LOW_SCALE_FACTOR = 1000.0
+MROS2_LOW_SCALE_FACTOR = 250.0
 
 
 # ============================================================
@@ -408,19 +422,138 @@ def subject_raw_std(
 # Dataset corrections
 # ============================================================
 
+def source_family(
+    source_name,
+):
+    """Map logical split names to the dataset name used by exclusions."""
+
+    if source_name.startswith("shhs1"):
+        return "shhs1"
+
+    if source_name.startswith("kiss"):
+        return "kiss"
+
+    return source_name
+
+
 def should_exclude_subject(
     source_name,
     subject_id,
 ):
 
-    if (
-        source_name == "kvss"
-        and subject_id
-        in KVSS_EXCLUDED_SUBJECTS
-    ):
-        return True
+    family = source_family(
+        source_name
+    )
 
-    return False
+    return str(subject_id) in EXCLUDED_SUBJECTS.get(
+        family,
+        set(),
+    )
+
+
+def print_subject_count_check():
+    """
+    Cheap preflight check: inspect only pickle metadata.
+
+    No mmap is opened, no spectrogram is generated, and no output
+    dataset is written.  This lets us compare subject/recording counts
+    with Keondo before launching the expensive preprocessing.
+    """
+
+    print()
+    print("=" * 88)
+    print("SUBJECT COUNT CHECK AFTER EXCLUSIONS")
+    print("=" * 88)
+    print(
+        f"{'source':<18} {'role':<6} "
+        f"{'metadata':>9} {'excluded':>9} "
+        f"{'remaining':>10} {'>=512 epochs':>12}"
+    )
+
+    train_metadata = 0
+    train_excluded = 0
+    train_remaining = 0
+    train_usable = 0
+
+    for source in SOURCES:
+        metadata = load_metadata(
+            source["pickle"]
+        )
+        sig_info = metadata[
+            "sig_info"
+        ]
+
+        total = len(sig_info)
+
+        excluded_ids = [
+            str(subject_id)
+            for subject_id in sig_info
+            if should_exclude_subject(
+                source["name"],
+                subject_id,
+            )
+        ]
+
+        excluded = len(
+            excluded_ids
+        )
+        remaining = total - excluded
+
+        usable = 0
+        for subject_id, info in sig_info.items():
+
+            if should_exclude_subject(
+                source["name"],
+                subject_id,
+            ):
+                continue
+
+            start, end = info[
+                "pos"
+            ]
+
+            if (
+                end - start
+            ) // WINDOW_EPOCHS > 0:
+                usable += 1
+
+        print(
+            f"{source['name']:<18} "
+            f"{source['split']:<6} "
+            f"{total:>9} "
+            f"{excluded:>9} "
+            f"{remaining:>10} "
+            f"{usable:>12}"
+        )
+
+        if excluded_ids:
+            print(
+                "  excluded:",
+                ", ".join(
+                    excluded_ids
+                ),
+            )
+
+        if source["split"] == "train":
+            train_metadata += total
+            train_excluded += excluded
+            train_remaining += remaining
+            train_usable += usable
+
+    print("-" * 88)
+    print(
+        f"{'TRAIN TOTAL':<18} {'train':<6} "
+        f"{train_metadata:>9} "
+        f"{train_excluded:>9} "
+        f"{train_remaining:>10} "
+        f"{train_usable:>12}"
+    )
+    print()
+    print(
+        "NOTE: these are metadata entries/recordings per source. "
+        "The '>=512 epochs' column is the number that can actually "
+        "produce at least one 256-minute VQGAN window."
+    )
 
 
 def subject_scale_factor(
@@ -429,7 +562,7 @@ def subject_scale_factor(
     sig_len,
 ):
 
-    # Only MrOS2 needs the x1000 correction.
+    # Only MrOS2 needs the x250 correction.
     if not source_name.startswith(
         "mros2_"
     ):
@@ -585,40 +718,61 @@ def compute_sleepmami_stats(
 
 
 # ============================================================
-# dB sampler
+# Exact TRAIN dB collector
 # ============================================================
 
-class DBSampler:
+class DBCollector:
     """
-    Collect a bounded random sample of TRAIN dB values.
+    Collect ALL valid TRAIN spectrogram dB values on local disk.
 
-    Invalid 30-s EEG epochs are excluded completely from
-    percentile estimation, matching Keondo's logic.
+    This replaces the previous bounded random DBSampler. No dB
+    values are sampled: every finite value from every valid 30-s
+    EEG epoch in the training pool contributes to the percentile
+    calculation.
+
+    Values are streamed as float32 to a temporary binary file so
+    RAM usage stays bounded. Exact percentiles are then computed
+    from a writable numpy.memmap with overwrite_input=True, which
+    avoids creating a second full-size in-memory copy.
     """
 
     def __init__(
         self,
-        max_values=2_000_000,
-        values_per_window=512,
-        seed=42,
+        cache_path=None,
     ):
 
-        self.max_values = (
-            max_values
-        )
-
-        self.values_per_window = (
-            values_per_window
-        )
-
-        self.rng = (
-            np.random.default_rng(
-                seed
+        if cache_path is None:
+            cache_path = (
+                Path("/tmp")
+                / f"vqgan_train_valid_db_{os.getpid()}.float32"
             )
+
+        self.cache_path = Path(
+            cache_path
         )
 
-        self.chunks = []
+        self.cache_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        # This preprocessing run is intentionally from scratch.
+        # Never append to values left by an older run.
+        if self.cache_path.exists():
+            self.cache_path.unlink()
+
+        self.file = self.cache_path.open(
+            "wb"
+        )
+
         self.total_values = 0
+        self.total_bytes = 0
+        self.closed = False
+
+        print(
+            "Exact TRAIN dB cache:",
+            self.cache_path,
+        )
 
     def add(
         self,
@@ -626,49 +780,48 @@ class DBSampler:
         valid_mask=None,
     ):
 
+        if self.closed:
+            raise RuntimeError(
+                "Cannot add values after DBCollector was closed."
+            )
+
         array = np.asarray(
             array,
             dtype=np.float32,
         )
 
-        # Spectrogram layout:
-        # frequency x time
+        # Spectrogram layout: frequency x time.
         if valid_mask is not None:
 
-            valid_mask = (
-                np.asarray(
-                    valid_mask,
-                    dtype=bool,
-                )
+            valid_mask = np.asarray(
+                valid_mask,
+                dtype=bool,
             )
 
             expected_shape = (
                 array.shape[1],
             )
 
-            if (
-                valid_mask.shape
-                != expected_shape
-            ):
+            if valid_mask.shape != expected_shape:
                 raise ValueError(
                     "Unexpected valid-mask shape: "
                     f"{valid_mask.shape}. "
                     f"Expected {expected_shape}."
                 )
 
+            # Keep every frequency value from every valid epoch.
             array = array[
                 :,
                 valid_mask,
             ]
 
-        flat = (
-            array.reshape(-1)
-        )
+        flat = array.reshape(-1)
 
         if flat.size == 0:
             return
 
-        # Should only contain valid dB values.
+        # Valid columns are expected to be finite, but keep this
+        # guard so only finite dB values can enter the percentiles.
         flat = flat[
             np.isfinite(flat)
         ]
@@ -676,89 +829,123 @@ class DBSampler:
         if flat.size == 0:
             return
 
-        count = min(
-            self.values_per_window,
-            flat.size,
+        flat = flat.astype(
+            np.float32,
+            copy=False,
         )
 
-        indices = (
-            self.rng.choice(
-                flat.size,
-                size=count,
-                replace=False,
-            )
+        flat.tofile(
+            self.file
         )
 
-        sampled = flat[
-            indices
-        ]
-
-        self.chunks.append(
-            sampled
+        self.total_values += int(
+            flat.size
         )
 
-        self.total_values += (
-            sampled.size
+        self.total_bytes += int(
+            flat.nbytes
         )
 
-        if (
-            self.total_values
-            > 2 * self.max_values
-        ):
-            self._compact()
-
-    def _compact(
+    def close(
         self,
     ):
 
-        if not self.chunks:
+        if self.closed:
             return
 
-        values = np.concatenate(
-            self.chunks
+        self.file.flush()
+        os.fsync(
+            self.file.fileno()
         )
+        self.file.close()
+        self.closed = True
 
-        if (
-            values.size
-            > self.max_values
-        ):
+    def compute_quantiles(
+        self,
+        quantile_low,
+        quantile_high,
+    ):
 
-            indices = (
-                self.rng.choice(
-                    values.size,
-                    size=self.max_values,
-                    replace=False,
-                )
+        self.close()
+
+        if self.total_values <= 0:
+            raise RuntimeError(
+                "No valid training dB values were collected."
             )
 
-            values = values[
-                indices
-            ]
-
-        self.chunks = [
-            values.astype(
-                np.float32,
-                copy=False,
-            )
-        ]
-
-        self.total_values = (
-            values.size
+        expected_bytes = (
+            self.total_values
+            * np.dtype(np.float32).itemsize
         )
 
-    def get_values(
+        actual_bytes = (
+            self.cache_path.stat().st_size
+        )
+
+        if actual_bytes != expected_bytes:
+            raise RuntimeError(
+                "dB cache size mismatch: "
+                f"expected {expected_bytes} bytes, "
+                f"found {actual_bytes}."
+            )
+
+        print()
+        print("=" * 72)
+        print("EXACT TRAIN dB QUANTILES")
+        print("all valid dB values:", self.total_values)
+        print(
+            "cache size GiB:",
+            f"{actual_bytes / (1024 ** 3):.3f}",
+        )
+        print(
+            "quantiles:",
+            quantile_low,
+            quantile_high,
+            "(equivalent percentiles:",
+            100.0 * quantile_low,
+            100.0 * quantile_high,
+            ")",
+        )
+
+        values = np.memmap(
+            self.cache_path,
+            dtype=np.float32,
+            mode="r+",
+            shape=(self.total_values,),
+        )
+
+        bounds = np.quantile(
+            values,
+            [
+                quantile_low,
+                quantile_high,
+            ],
+            method="linear",
+            overwrite_input=True,
+        )
+
+        # Flush the in-place partition performed by numpy before
+        # releasing the mmap. The cache is only temporary.
+        values.flush()
+        del values
+
+        min_db = float(
+            bounds[0]
+        )
+        max_db = float(
+            bounds[1]
+        )
+
+        return min_db, max_db
+
+    def cleanup(
         self,
     ):
 
-        self._compact()
+        self.close()
 
-        if not self.chunks:
-            raise RuntimeError(
-                "No valid training dB "
-                "values were sampled."
-            )
-
-        return self.chunks[0]
+        if self.cache_path.exists():
+            self.cache_path.unlink()
 
 
 # ============================================================
@@ -912,7 +1099,7 @@ def make_spectrogram(
     # The final TRAIN min_db is not known yet.
     #
     # These columns are completely excluded from the TRAIN
-    # percentile sampler. After min_db has been computed,
+    # quantile collector. After min_db has been computed,
     # they are rewritten to min_db so that the existing
     # VQGAN loader automatically maps them to exactly 0.
     #
@@ -938,7 +1125,7 @@ def make_spectrogram(
 def process_source(
     source,
     output_root,
-    db_sampler,
+    db_collector,
     manifests,
     max_windows_per_source=None,
     overwrite=False,
@@ -1363,7 +1550,7 @@ def process_source(
                 == "train"
             ):
 
-                db_sampler.add(
+                db_collector.add(
                     spectrogram_db,
                     valid_mask=(
                         valid_mask
@@ -1568,11 +1755,19 @@ def finalize_invalid_epochs(
                 ~valid_mask
             )
 
-            num_invalid_epochs += (
-                int(
-                    invalid_mask.sum()
-                )
+            n_invalid = int(
+                invalid_mask.sum()
             )
+
+            num_invalid_epochs += (
+                n_invalid
+            )
+
+            # Most files have no rejected epochs. Avoid rewriting
+            # an entire NPZ on NFS when there is nothing to change.
+            if n_invalid == 0:
+                num_files += 1
+                continue
 
             # Final dB representation of invalid epochs.
             #
@@ -1632,7 +1827,7 @@ def main():
         type=Path,
         default=Path(
             "outputs/"
-            "vqgan_multidataset_preprocessed"
+            "vqgan_multidataset_preprocessed_artifact_all_db"
         ),
     )
 
@@ -1653,28 +1848,81 @@ def main():
     )
 
     parser.add_argument(
-        "--percentile-low",
-        type=float,
-        default=0.1,
+        "--check-subject-counts-only",
+        action="store_true",
+        help=(
+            "Print metadata/exclusion/usable-subject counts and exit "
+            "without generating spectrograms."
+        ),
     )
 
     parser.add_argument(
-        "--percentile-high",
+        "--quantile-low",
         type=float,
-        default=99.9,
+        default=0.001,
+        help=(
+            "Lower dB quantile in [0,1]. "
+            "0.001 = 0.1th percentile."
+        ),
+    )
+
+    parser.add_argument(
+        "--quantile-high",
+        type=float,
+        default=0.999,
+        help=(
+            "Upper dB quantile in [0,1]. "
+            "0.999 = 99.9th percentile."
+        ),
+    )
+
+    parser.add_argument(
+        "--db-cache-path",
+        type=Path,
+        default=None,
+        help=(
+            "Optional local binary cache for ALL valid TRAIN dB values. "
+            "Default: /tmp/vqgan_train_valid_db_<pid>.float32"
+        ),
+    )
+
+    parser.add_argument(
+        "--keep-db-cache",
+        action="store_true",
+        help=(
+            "Keep the temporary all-dB binary cache after percentile "
+            "calculation. By default it is deleted."
+        ),
     )
 
     args = (
         parser.parse_args()
     )
 
+    if args.check_subject_counts_only:
+        print_subject_count_check()
+        return
+
+    if not (
+        0.0 <= args.quantile_low
+        < args.quantile_high
+        <= 1.0
+    ):
+        raise ValueError(
+            "Quantiles must satisfy "
+            "0 <= quantile_low < quantile_high <= 1. "
+            f"Got {args.quantile_low}, {args.quantile_high}."
+        )
+
     args.output_root.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    db_sampler = (
-        DBSampler()
+    db_collector = DBCollector(
+        cache_path=(
+            args.db_cache_path
+        ),
     )
 
     manifests = {
@@ -1698,8 +1946,8 @@ def main():
                 output_root=(
                     args.output_root
                 ),
-                db_sampler=(
-                    db_sampler
+                db_collector=(
+                    db_collector
                 ),
                 manifests=(
                     manifests
@@ -1722,28 +1970,59 @@ def main():
         ] = count
 
     # --------------------------------------------------------
-    # TRAIN-only dB normalization
+    # TRAIN-only exact dB normalization
     #
-    # Invalid EEG epochs were excluded from DBSampler.
+    # ALL finite dB values from ALL valid TRAIN EEG epochs
+    # contribute. There is no random sampling or value cap.
     # --------------------------------------------------------
 
-    train_db_values = (
-        db_sampler.get_values()
-    )
-
-    min_db = float(
-        np.percentile(
-            train_db_values,
-            args.percentile_low,
+    min_db, max_db = (
+        db_collector.compute_quantiles(
+            quantile_low=(
+                args.quantile_low
+            ),
+            quantile_high=(
+                args.quantile_high
+            ),
         )
     )
 
-    max_db = float(
-        np.percentile(
-            train_db_values,
-            args.percentile_high,
-        )
+    total_train_db_values = (
+        db_collector.total_values
     )
+
+    db_cache_path = str(
+        db_collector.cache_path
+    )
+
+    # Save the exact bounds immediately, before the final NPZ rewrite.
+    # If NFS fails during finalization, the expensive quantile result
+    # is still preserved on disk.
+    bounds_checkpoint_path = (
+        args.output_root
+        / "exact_db_bounds.json"
+    )
+
+    with bounds_checkpoint_path.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            {
+                "min_db": min_db,
+                "max_db": max_db,
+                "quantile_low": args.quantile_low,
+                "quantile_high": args.quantile_high,
+                "percentile_low": 100.0 * args.quantile_low,
+                "percentile_high": 100.0 * args.quantile_high,
+                "num_values": total_train_db_values,
+                "mode": "all_valid_train_db_values_exact",
+                "dtype": "float32",
+                "cache_path": db_cache_path,
+            },
+            file,
+            indent=2,
+        )
 
     if max_db <= min_db:
         raise RuntimeError(
@@ -1815,13 +2094,37 @@ def main():
         "min_db": min_db,
         "max_db": max_db,
 
+        "quantile_low": (
+            args.quantile_low
+        ),
+
+        "quantile_high": (
+            args.quantile_high
+        ),
+
         "percentile_low": (
-            args.percentile_low
+            100.0 * args.quantile_low
         ),
 
         "percentile_high": (
-            args.percentile_high
+            100.0 * args.quantile_high
         ),
+
+        "db_percentile_estimation": {
+            "mode": (
+                "all_valid_train_db_values_exact"
+            ),
+            "num_values": (
+                total_train_db_values
+            ),
+            "dtype": "float32",
+            "temporary_cache": (
+                db_cache_path
+            ),
+            "cache_kept": bool(
+                args.keep_db_cache
+            ),
+        },
 
         "waveform_stats": (
             waveform_stats
@@ -1863,11 +2166,11 @@ def main():
             ),
         },
 
-        "kvss_excluded_subjects": (
-            sorted(
-                KVSS_EXCLUDED_SUBJECTS
-            )
-        ),
+        "excluded_subjects": {
+            dataset: sorted(subjects)
+            for dataset, subjects
+            in EXCLUDED_SUBJECTS.items()
+        },
 
         "mros2_low_scale_std_threshold": (
             MROS2_LOW_SCALE_STD_THRESHOLD
@@ -1988,7 +2291,7 @@ def main():
     )
 
     print(
-        "TRAIN dB bounds:",
+        "Exact TRAIN dB bounds:",
         min_db,
         max_db,
     )
@@ -2015,6 +2318,17 @@ def main():
         args.output_root
         / "test_manifest.jsonl",
     )
+
+    print(
+        "Exact dB bounds checkpoint:",
+        bounds_checkpoint_path,
+    )
+
+    # Delete the large local binary cache only after the complete
+    # preprocessing pipeline succeeded. If the run fails earlier,
+    # the cache is intentionally left in place for debugging/recovery.
+    if not args.keep_db_cache:
+        db_collector.cleanup()
 
 
 if __name__ == "__main__":
