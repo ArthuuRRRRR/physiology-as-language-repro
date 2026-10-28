@@ -569,7 +569,7 @@ def main():
 
     parser.add_argument(
         "--dataset",
-        choices=["shhs1", "mesa", "cfs"],
+        choices=["shhs1", "mesa", "cfs", "dreamt"],
         required=True,
     )
 

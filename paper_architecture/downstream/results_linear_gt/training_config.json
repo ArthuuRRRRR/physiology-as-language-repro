@@ -1,0 +1,25 @@
+{
+  "experiment": "per_epoch_linear_sleep_staging",
+  "paper_exact": false,
+  "keondo_guidance": "Simple linear method on reconstructed spectrogram.",
+  "input_type": "ground_truth",
+  "architecture": "Linear(256,4)",
+  "temporal_context": null,
+  "loss": "standard unweighted cross_entropy",
+  "optimizer": "AdamW",
+  "scheduler": "linear warmup then constant",
+  "epochs": 15,
+  "warmup_epochs": 3,
+  "lr": 0.001,
+  "weight_decay": 0.01,
+  "batch_size_nights": 4,
+  "seed": 42,
+  "model_config": {
+    "freq_bins": 256,
+    "num_classes": 4
+  },
+  "trainable_parameters": 1028,
+  "checkpoint_best": "validation macro-F1",
+  "secondary_checkpoint": "validation segment accuracy",
+  "note": "Every available 30-s spectrogram column is used. No temporal context, hidden layer, Transformer, or class weighting."
+}

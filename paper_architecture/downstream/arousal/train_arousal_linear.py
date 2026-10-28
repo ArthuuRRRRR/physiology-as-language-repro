@@ -31,7 +31,6 @@ DEFAULT_OUTPUT_DIR = Path(
 WAKE_STAGE = 0
 AROUSAL_LABEL_SEC = 30
 
-
 @dataclass
 class SplitTable:
     split: str
